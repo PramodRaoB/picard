@@ -1636,16 +1636,6 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
         }
     }
 
-    private static class QueryNameComparator implements Comparator<ReadEndsWithName> {
-        public int compare(final ReadEndsWithName lhs, final ReadEndsWithName rhs) {
-            int compare = Integer.compare(lhs.readEnds.libraryId, rhs.readEnds.libraryId);
-            if (compare == 0) {
-                compare = lhs.readName.compareTo(rhs.readName);
-            }
-            return compare;
-        }
-    }
-
     /**
      * Comparator for ReadEndsForMarkDuplicates that orders by read1 position then pair orientation then read2 position.
      */
