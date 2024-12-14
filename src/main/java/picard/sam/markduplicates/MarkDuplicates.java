@@ -37,12 +37,14 @@ import picard.sam.DuplicationMetrics;
 import picard.sam.markduplicates.util.*;
 import picard.sam.util.RepresentativeReadIndexer;
 
+import javax.annotation.Nullable;
 import java.io.File;
-import java.util.Objects;
-import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.List;
-import java.util.Map;
+import java.io.IOException;
+import java.util.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.function.Supplier;
 
 /**
  * A better duplication marking algorithm that handles all cases including clipped
@@ -217,21 +219,27 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
             "the BARCODE_TAG option be set to a non null value.  Default null.", optional = true)
     public String MOLECULAR_IDENTIFIER_TAG = null;
 
+    @Argument(doc = "Number of reader/writer threads to use. Note that an index file is required for actually multithreading")
+    public int NUM_THREADS = 1;
+
     @ArgumentCollection
     public MarkDuplicatesForFlowArgumentCollection flowBasedArguments = new MarkDuplicatesForFlowArgumentCollection();
 
-    protected SortingCollection<ReadEndsForMarkDuplicates> pairSort;
-    protected SortingCollection<ReadEndsForMarkDuplicates> fragSort;
-    protected SortingLongCollection duplicateIndexes;
-    protected SortingLongCollection opticalDuplicateIndexes;
-    protected SortingCollection<RepresentativeReadIndexer> representativeReadIndicesForDuplicates;
+    protected MergingIteratorForSortingCollections<ReadEndsForMarkDuplicates> pairSort;
+    protected MergingIteratorForSortingCollections<ReadEndsForMarkDuplicates> fragSort;
+    protected GenomicPartitionedCollection<SortingLongCollection> duplicateIndexes;
+    protected GenomicPartitionedCollection<SortingLongCollection> opticalDuplicateIndexes;
+    protected GenomicPartitionedCollection<SortingCollection<RepresentativeReadIndexer>> representativeReadIndicesForDuplicates;
+    protected List<GenomicWindow> windows;
+    private Long totalRecords = 0L;
+    private boolean useMultithreading;
 
     // some calculations are performed using a helper class, which can be parameter specific
     // by default, this instance is the helper
     private MarkDuplicatesHelper calcHelper = this;
 
     private int numDuplicateIndices = 0;
-    static private final long NO_SUCH_INDEX = Long.MAX_VALUE; // needs to be large so that that >= test fails for query-sorted traversal
+    static private final long NO_SUCH_INDEX = Long.MAX_VALUE; // needs to be large so that >= test fails for query-sorted traversal
 
     protected LibraryIdGenerator libraryIdGenerator = null; // this is initialized in buildSortedReadEndLists
 
@@ -245,6 +253,55 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
 
     public MarkDuplicates() {
         DUPLICATE_SCORING_STRATEGY = ScoringStrategy.SUM_OF_BASE_QUALITIES;
+    }
+
+    public class OperationTimer {
+        private static class TimingInfo {
+            long startTime;
+            long totalTime;
+            int calls;
+
+            void start() {
+                if (startTime != 0) {
+                    throw new IllegalStateException("Timer already started");
+                }
+                startTime = System.nanoTime();
+            }
+
+            void stop() {
+                if (startTime == 0) {
+                    throw new IllegalStateException("Timer not started");
+                }
+                totalTime += System.nanoTime() - startTime;
+                startTime = 0;
+                calls++;
+            }
+
+            String getStats() {
+                long seconds = totalTime / 1_000_000_000;
+                return String.format("%d min %d sec (calls: %d)", seconds / 60, seconds % 60, calls);
+            }
+        }
+
+        private static final Map<String, TimingInfo> timers = new HashMap<>();
+
+        public static void start(String operation) {
+            timers.computeIfAbsent(operation, k -> new TimingInfo()).start();
+        }
+
+        public static void stop(String operation) {
+            TimingInfo info = timers.get(operation);
+            if (info == null) {
+                throw new IllegalArgumentException("Unknown operation: " + operation);
+            }
+            info.stop();
+        }
+
+        public static void printStats(Log log) {
+            StringBuilder message = new StringBuilder("\nTiming Statistics:\n");
+            timers.forEach((op, info) -> message.append(String.format("%s: %s\n", op, info.getStats())));
+            log.info(message.toString());
+        }
     }
 
     /**
@@ -261,15 +318,31 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
         final boolean useBarcodes = (null != BARCODE_TAG || null != READ_ONE_BARCODE_TAG || null != READ_TWO_BARCODE_TAG);
 
         // use flow based calculation helper?
-        if ( flowBasedArguments.FLOW_MODE ) {
+        if (flowBasedArguments.FLOW_MODE) {
             calcHelper = new MarkDuplicatesForFlowHelper(this);
         }
 
         reportMemoryStats("Start of doWork");
+        log.info("Calculating genomic windows for parallel processing...");
+        OperationTimer.start("Calculating genomic windows");
+        windows = calculateGenomicWindows();
+        OperationTimer.stop("Calculating genomic windows");
+
+        useMultithreading = !windows.isEmpty();
+        if (!useMultithreading) {
+            log.warn("Could not create processing windows. Proceeding with single-threaded exception.");
+        } else {
+            log.info("Created " + windows.size() + " processing windows");
+        }
         log.info("Reading input file and constructing read end information.");
+        OperationTimer.start("Building sorted read end lists");
         buildSortedReadEndLists(useBarcodes);
+        if (useMultithreading) windows.sort((w1, w2) -> Long.compare(w2.recordCount, w1.recordCount));
+        OperationTimer.stop("Building sorted read end lists");
         reportMemoryStats("After buildSortedReadEndLists");
+        OperationTimer.start("Generating duplicate indexes");
         calcHelper.generateDuplicateIndexes(useBarcodes, this.REMOVE_SEQUENCING_DUPLICATES || this.TAGGING_POLICY != DuplicateTaggingPolicy.DontTag);
+        OperationTimer.stop("Generating duplicate indexes");
 
         reportMemoryStats("After generateDuplicateIndexes");
         log.info("Marking " + this.numDuplicateIndices + " records as duplicates.");
@@ -278,6 +351,10 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
             log.warn("Skipped optical duplicate cluster discovery; library size estimation may be inaccurate!");
         } else {
             log.info("Found " + (this.libraryIdGenerator.getNumberOfOpticalDuplicateClusters()) + " optical duplicate clusters.");
+        }
+
+        for (GenomicWindow window : windows) {
+            log.info("Window has " + window.recordCount);
         }
 
         final SamHeaderAndIterator headerAndIterator = openInputs(false);
@@ -304,15 +381,93 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
 
         COMMENT.forEach(outputHeader::addComment);
 
+        OperationTimer.start("Main reader/writer loop");
+        ExecutorService executor = Executors.newFixedThreadPool(NUM_THREADS);
+        List<Future<WindowResult>> futures = new ArrayList<>();
+
+        for (int i = 0; i < windows.size(); i++) {
+            final GenomicWindow window = windows.get(i);
+            final int windowIndex = i;
+            futures.add(executor.submit(() -> processWindow(window, windowIndex)));
+        }
+
+        if (!useMultithreading) {
+            futures.add(executor.submit(() -> processWindow(null, 0)));
+        }
+
+        // Collect and concatenate results
+        log.info("Waiting for windows to complete...");
+        try {
+            List<File> tempFiles = new ArrayList<>(Collections.nCopies(Math.max(windows.size(), 1), null));
+            int idx = 0;
+            for (Future<WindowResult> future : futures) {
+                WindowResult result = future.get();
+                final int originalIndex = useMultithreading ? windows.get(idx).windowIndex : 0;
+                log.info("Setting index " + originalIndex);
+                tempFiles.set(originalIndex, result.tempFile);
+
+                for (Map.Entry<String, DuplicationMetrics> entry :
+                        result.metrics.getMetricsByLibraryMap().entrySet()) {
+                    DuplicationMetrics globalMetric = this.libraryIdGenerator.getMetricsByLibrary(entry.getKey());
+                    if (globalMetric == null) {
+                        globalMetric = entry.getValue();
+                        this.libraryIdGenerator.addMetricsByLibrary(entry.getKey(), globalMetric);
+                    } else {
+                        globalMetric.merge(entry.getValue());
+                    }
+                }
+                idx++;
+            }
+
+            log.info("Concatenating " + tempFiles.size() + " temp files...");
+            concatenateFiles(tempFiles);
+        } catch (Exception e) {
+            log.error("Exception occurred", e);
+        }
+
+        executor.shutdown();
+        headerAndIterator.iterator.close();
+        OperationTimer.stop("Main reader/writer loop");
+
+        log.info("Closed outputs. Getting more Memory Stats.");
+        reportMemoryStats("After output close");
+
+        OperationTimer.printStats(log);
+
+        // Write out the metrics
+        finalizeAndWriteMetrics(libraryIdGenerator, getMetricsFile(), METRICS_FILE);
+
+        return 0;
+    }
+
+    private WindowResult processWindow(@Nullable GenomicWindow window, int windowIndex) throws IOException {
+        long startTime = System.nanoTime();
+        File tempFile = File.createTempFile("window_" + windowIndex + "_", ".bam");
+        log.info(String.format("Processing starting for window index %d", windowIndex));
+        final SamHeaderAndIterator headerAndIterator = openInputs(false);
+        final SAMFileHeader header = headerAndIterator.header;
+        final SAMFileHeader.SortOrder sortOrder = header.getSortOrder();
+
+        final SAMFileHeader outputHeader = header.clone();
+
         // Key: previous PG ID on a SAM Record (or null).  Value: New PG ID to replace it.
         final Map<String, String> chainedPgIds = getChainedPgIds(outputHeader);
+        LibraryIdGenerator localMetrics = new LibraryIdGenerator(headerAndIterator.header, flowBasedArguments.FLOW_MODE);
 
-        try (SAMFileWriter out = new SAMFileWriterFactory().makeWriter(outputHeader, true, OUTPUT,REFERENCE_SEQUENCE)){
-
+        try (SAMFileWriter out = new SAMFileWriterFactory().makeWriter(outputHeader, true, tempFile, REFERENCE_SEQUENCE)) {
             // Now copy over the file while marking all the necessary indexes as duplicates
+            SortingLongCollection duplicateIndexes = this.duplicateIndexes.getPartition(windowIndex);
+
+            SortingLongCollection opticalDuplicateIndexes = this.opticalDuplicateIndexes != null ? this.opticalDuplicateIndexes.getPartition(windowIndex) : null;
+
+            SortingCollection<RepresentativeReadIndexer> representativeReadIndicesForDuplicates = null;
+            if (TAG_DUPLICATE_SET_MEMBERS && this.representativeReadIndicesForDuplicates != null) {
+                representativeReadIndicesForDuplicates = this.representativeReadIndicesForDuplicates.getPartition(windowIndex);
+            }
+
             long recordInFileIndex = 0;
-            long nextOpticalDuplicateIndex = this.opticalDuplicateIndexes != null && this.opticalDuplicateIndexes.hasNext() ? this.opticalDuplicateIndexes.next() : NO_SUCH_INDEX;
-            long nextDuplicateIndex = (this.duplicateIndexes.hasNext() ? this.duplicateIndexes.next() : NO_SUCH_INDEX);
+            long nextOpticalDuplicateIndex = opticalDuplicateIndexes != null && opticalDuplicateIndexes.hasNext() ? opticalDuplicateIndexes.next() : NO_SUCH_INDEX;
+            long nextDuplicateIndex = (duplicateIndexes.hasNext() ? duplicateIndexes.next() : NO_SUCH_INDEX);
 
             // initialize variables for optional representative read tagging
             CloseableIterator<RepresentativeReadIndexer> representativeReadIterator = null;
@@ -321,7 +476,7 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
             int duplicateSetSize = -1;
             int nextReadInDuplicateSetIndex = -1;
             if (TAG_DUPLICATE_SET_MEMBERS) {
-                representativeReadIterator = this.representativeReadIndicesForDuplicates.iterator();
+                representativeReadIterator = representativeReadIndicesForDuplicates.iterator();
                 if (representativeReadIterator.hasNext()) {
                     rri = representativeReadIterator.next();
                     nextReadInDuplicateSetIndex = rri.readIndexInFile;
@@ -331,18 +486,27 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
             }
 
             final ProgressLogger progress = new ProgressLogger(log, (int) 1e7, "Written");
-            final CloseableIterator<SAMRecord> iterator = headerAndIterator.iterator;
+            CloseableIterator<SAMRecord> iterator;
+            if (useMultithreading) {
+                final SamReader reader = getReaders(false).get(0);
+                iterator = window.isUnmapped() ?
+                        reader.queryUnmapped() :
+                        reader.query(window.reference, window.start, window.end, false);
+                recordInFileIndex = window.startingIndex;
+                headerAndIterator.iterator.close();
+            }
+            else iterator = headerAndIterator.iterator;
             String duplicateQueryName = null;
             String representativeQueryName = null;
 
             while (iterator.hasNext()) {
                 final SAMRecord rec = iterator.next();
 
-                DuplicationMetrics metrics = AbstractMarkDuplicatesCommandLineProgram.addReadToLibraryMetrics(rec, header, libraryIdGenerator, flowBasedArguments.FLOW_MODE);
+                DuplicationMetrics metrics = AbstractMarkDuplicatesCommandLineProgram.addReadToLibraryMetrics(rec, header, localMetrics, flowBasedArguments.FLOW_MODE);
 
                 // Now try and figure out the next duplicate index (if going by coordinate. if going by query name, only do this
                 // if the query name has changed.
-                nextDuplicateIndex = nextIndexIfNeeded(sortOrder, recordInFileIndex, nextDuplicateIndex, duplicateQueryName, rec, this.duplicateIndexes);
+                nextDuplicateIndex = nextIndexIfNeeded(sortOrder, recordInFileIndex, nextDuplicateIndex, duplicateQueryName, rec, duplicateIndexes);
 
                 final boolean isDuplicate = recordInFileIndex == nextDuplicateIndex ||
                         (sortOrder == SAMFileHeader.SortOrder.queryname &&
@@ -355,7 +519,7 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
                 } else {
                     rec.setDuplicateReadFlag(false);
                 }
-                nextOpticalDuplicateIndex = nextIndexIfNeeded(sortOrder, recordInFileIndex, nextOpticalDuplicateIndex, duplicateQueryName, rec, this.opticalDuplicateIndexes);
+                nextOpticalDuplicateIndex = nextIndexIfNeeded(sortOrder, recordInFileIndex, nextOpticalDuplicateIndex, duplicateQueryName, rec, opticalDuplicateIndexes);
 
                 final boolean isOpticalDuplicate = sortOrder == SAMFileHeader.SortOrder.queryname &&
                         recordInFileIndex > nextOpticalDuplicateIndex &&
@@ -428,27 +592,27 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
             }
 
             // remember to close the inputs
-            log.info("Writing complete. Closing input iterator.");
             iterator.close();
 
-            log.info("Duplicate Index cleanup.");
-            this.duplicateIndexes.cleanup();
+            duplicateIndexes.cleanup();
             if (TAG_DUPLICATE_SET_MEMBERS) {
-                log.info("Representative read Index cleanup.");
-                this.representativeReadIndicesForDuplicates.cleanup();
+                representativeReadIndicesForDuplicates.cleanup();
             }
-
-            log.info("Getting Memory Stats.");
-            reportMemoryStats("Before output close");
         }
-        log.info("Closed outputs. Getting more Memory Stats.");
-        reportMemoryStats("After output close");
+        log.info("For writing window " + windowIndex + " took " + (System.nanoTime() - startTime) / 1_000_000_000 + " seconds.");
 
-        // Write out the metrics
-        finalizeAndWriteMetrics(libraryIdGenerator, getMetricsFile(), METRICS_FILE);
-
-        return 0;
+        return new WindowResult(tempFile, localMetrics);
     }
+
+    private void concatenateFiles(List<File> tempFiles) throws IOException {
+        BamFileIoUtils.gatherWithBlockCopying(tempFiles, OUTPUT, false, false);
+
+        // Clean up temp files
+        for (File tempFile : tempFiles) {
+            tempFile.delete();
+        }
+    }
+
 
     /**
      * package-visible for testing
@@ -468,6 +632,146 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
     }
 
     /**
+     * Calculates genomic windows for parallel processing based on header and index metadata
+     */
+    private List<GenomicWindow> calculateGenomicWindows() {
+        List<GenomicWindow> windows = new ArrayList<>();
+        long currentIndex = 0;
+        boolean metaNotFound = false;
+
+        try (SamReader reader = SamReaderFactory.makeDefault()
+                .enable(SamReaderFactory.Option.CACHE_FILE_BASED_INDEXES)
+                .open(new File(INPUT.get(0)))) {
+
+            if (reader.hasIndex()) {
+                BAMIndex index = reader.indexing().getIndex();
+                SAMFileHeader header = reader.getFileHeader();
+                long unmappedCount = 0;
+
+                log.info("Number of reference sequences: " + header.getSequenceDictionary().size());
+                int cnt = 0;
+                for (int i = 0; i < header.getSequenceDictionary().size(); i++) {
+                    SAMSequenceRecord seq = header.getSequence(i);
+                    BAMIndexMetaData metadata = index.getMetaData(i);
+
+                    if (metadata != null) {
+                        long mappedReads = metadata.getAlignedRecordCount();
+                        long unmappedForRef = metadata.getUnalignedRecordCount();
+                        if (mappedReads > 0) {
+                            GenomicWindow window = new GenomicWindow(
+                                    seq.getSequenceName(),
+                                    1,
+                                    seq.getSequenceLength(),
+                                    currentIndex,
+                                    mappedReads,
+                                    cnt
+                            );
+                            currentIndex += mappedReads;
+                            // Split large windows based on density
+                            List<GenomicWindow> splitWindows = splitGenomicWindow(window, cnt, index, i);
+                            windows.addAll(splitWindows);
+                            cnt += splitWindows.size();
+                        }
+                        this.totalRecords += mappedReads;
+                        unmappedCount += unmappedForRef;
+                    } else {
+                        log.info("Metadata not found for reference: " + seq.getSequenceName());
+                        metaNotFound = true;
+                        break;
+                    }
+                }
+
+                log.info("Total unmapped count across all references: " + unmappedCount);
+                if (unmappedCount > 0) {
+                    windows.add(new GenomicWindow(null, -1, -1, currentIndex, unmappedCount, cnt));
+                }
+            } else metaNotFound = true;
+            if (metaNotFound) {
+                log.info("Index file is not present or incomplete. Proceeding without multi-threading");
+                return new ArrayList<>();
+            }
+        } catch (IOException ignored) {
+            log.info("Index file is not present or incomplete. Proceeding without multi-threading");
+            return new ArrayList<>();
+        }
+
+        return windows;
+    }
+
+
+    private List<GenomicWindow> splitGenomicWindow(GenomicWindow window, int windowStartIndex, BAMIndex index, int refIndex) {
+        List<GenomicWindow> windows = new ArrayList<>();
+        final long TARGET_RECORDS_PER_WINDOW = 3_000_000L;
+
+        try {
+            // Get density information
+            List<BAMDensityUtil.DensityWindow> densityWindows =
+                    BAMDensityUtil.getDensityWindows(index, refIndex, window.end);
+
+            if (densityWindows.isEmpty()) {
+                return Collections.singletonList(window);
+            }
+
+            // Calculate total density to normalize estimates
+            long totalDensity = densityWindows.stream()
+                    .mapToLong(dw -> dw.estimatedReads)
+                    .sum();
+
+            double readsPerDensityUnit = (double) window.recordCount / totalDensity;
+
+            // Create windows based on density
+            long accumulatedReads = 0;
+            int currentStart = window.start;
+            long currentStartingIndex = window.startingIndex;
+            List<BAMDensityUtil.DensityWindow> currentRegions = new ArrayList<>();
+
+            for (BAMDensityUtil.DensityWindow densityWindow : densityWindows) {
+                long estimatedReads = (long) (densityWindow.estimatedReads * readsPerDensityUnit);
+                accumulatedReads += estimatedReads;
+                currentRegions.add(densityWindow);
+
+                if (accumulatedReads >= TARGET_RECORDS_PER_WINDOW) {
+                    // Create window from accumulated regions
+                    int endPosition = currentRegions.get(currentRegions.size() - 1).end;
+
+                    windows.add(new GenomicWindow(
+                            window.reference,
+                            currentStart,
+                            endPosition,
+                            currentStartingIndex,
+                            accumulatedReads,
+                            windowStartIndex++
+                    ));
+
+                    currentStart = endPosition + 1;
+                    currentStartingIndex += accumulatedReads;
+                    accumulatedReads = 0;
+                    currentRegions.clear();
+                }
+            }
+
+            // Add remaining regions if any
+            if (!currentRegions.isEmpty()) {
+                int endPosition = currentRegions.get(currentRegions.size() - 1).end;
+                windows.add(new GenomicWindow(
+                        window.reference,
+                        currentStart,
+                        endPosition,
+                        currentStartingIndex,
+                        accumulatedReads,
+                        windowStartIndex
+                ));
+            }
+
+            return windows;
+
+        } catch (Exception e) {
+            log.warn("Error splitting window by density, falling back to original window", e);
+            return Collections.singletonList(window);
+        }
+    }
+
+    /**
      * Goes through all the records in a file and generates a set of ReadEndsForMarkDuplicates objects that
      * hold the necessary information (reference sequence, 5' read coordinate) to do
      * duplication, caching to disk as necessary to sort them.
@@ -480,7 +784,145 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
             sizeInBytes = ReadEndsForMarkDuplicates.getSizeOf();
         }
         MAX_RECORDS_IN_RAM = (int) (Runtime.getRuntime().maxMemory() / sizeInBytes) / 2;
-        final int maxInMemory = (int) ((Runtime.getRuntime().maxMemory() * SORTING_COLLECTION_SIZE_RATIO) / sizeInBytes);
+        int maxInMemory = (int) ((Runtime.getRuntime().maxMemory() * SORTING_COLLECTION_SIZE_RATIO) / sizeInBytes);
+
+        final ReadEndsForMarkDuplicatesCodec pairCodec;
+        if (useBarcodes) {
+            pairCodec = new ReadEndsForMarkDuplicatesWithBarcodesCodec();
+        } else {
+            pairCodec = new ReadEndsForMarkDuplicatesCodec();
+        }
+
+        final SamHeaderAndIterator headerAndIterator = openInputs(true);
+        final SAMFileHeader header = headerAndIterator.header;
+        ReadEndsForMarkDuplicatesCodec diskCodec;
+        if (useBarcodes) diskCodec = new ReadEndsForMarkDuplicatesWithBarcodesCodec();
+        else diskCodec = new ReadEndsForMarkDuplicatesCodec();
+        final ReadEndsForMarkDuplicatesMap tmp = useMultithreading ? new DiskBasedReadEndsForMarkDuplicatesMap(MAX_FILE_HANDLES_FOR_READ_ENDS_MAP, diskCodec) : null;
+
+        if (null == this.libraryIdGenerator) {
+            this.libraryIdGenerator = new LibraryIdGenerator(header, flowBasedArguments.FLOW_MODE);
+        }
+
+        ExecutorService executor = Executors.newFixedThreadPool(NUM_THREADS);
+        List<Future<ThreadLocalReadEnds>> futures = new ArrayList<>();
+
+        for (GenomicWindow window : windows) {
+            futures.add(executor.submit(() -> processWindowForReadEnds(window, useBarcodes)));
+        }
+
+        if (!useMultithreading) futures.add(executor.submit(() -> processWindowForReadEnds(null, useBarcodes)));
+        headerAndIterator.iterator.close();
+        List<SortingCollection<ReadEndsForMarkDuplicates>> fragList = new ArrayList<>();
+        List<SortingCollection<ReadEndsForMarkDuplicates>> pairList = new ArrayList<>();
+        List<SingleMemoryBasedReadEndsForMarkDuplicatesMap> extraList = new ArrayList<>();
+
+        SortingCollection<ReadEndsForMarkDuplicates> pairSort = SortingCollection.newInstance(ReadEndsForMarkDuplicates.class,
+                pairCodec,
+                new ReadEndsMDComparator(useBarcodes),
+                maxInMemory,
+                TMP_DIR);
+        try {
+            for (Future<ThreadLocalReadEnds> future : futures) {
+                ThreadLocalReadEnds threadResults = future.get();
+                fragList.add(threadResults.localFragSort);
+                pairList.add(threadResults.localPairSort);
+                mergeCollection(this.pgIdsSeen, threadResults.pgIdsSeen);
+                if (useMultithreading) extraList.add((SingleMemoryBasedReadEndsForMarkDuplicatesMap) threadResults.map);
+            }
+        } catch (Exception e) {
+            throw new PicardException("Error processing windows", e);
+        }
+        if (useMultithreading) {
+            long startingIndex = 0;
+            for (int idx = 0; idx < windows.size(); idx++) {
+                // Set the correct starting index for later steps
+                windows.get(idx).setStartingIndex(startingIndex);
+                SingleMemoryBasedReadEndsForMarkDuplicatesMap map = extraList.get(idx);
+                for (Map.Entry<String, ReadEndsForMarkDuplicates> entry : map.entrySet()) {
+                    String key = entry.getKey();
+                    ReadEndsForMarkDuplicates fragmentEnd = entry.getValue();
+                    // Correct the index of this readEnd
+                    fragmentEnd.read1IndexInFile = fragmentEnd.read1IndexInFile + startingIndex;
+                    ReadEndsForMarkDuplicates pairedEnds = tmp.remove(fragmentEnd.read1ReferenceIndex, key);
+                    // See if we've already seen the first end or not
+                    if (pairedEnds == null) {
+                        // at this point pairedEnds and fragmentEnd are the same, but we need to make
+                        // a copy since pairedEnds will be modified when the mate comes along.
+                        pairedEnds = fragmentEnd.clone();
+                        tmp.put(pairedEnds.read2ReferenceIndex, key.toString(), pairedEnds);
+                    } else {
+                        final int matesRefIndex = fragmentEnd.read1ReferenceIndex;
+                        final int matesCoordinate = fragmentEnd.read1Coordinate;
+
+                        // Set orientationForOpticalDuplicates, which always goes by the first then the second end for the strands.  NB: must do this
+                        // before updating the orientation later.
+                        if (fragmentEnd.firstOfFlag == 1) {
+                            pairedEnds.orientationForOpticalDuplicates = ReadEnds.getOrientationByte(fragmentEnd.orientation == ReadEnds.R, pairedEnds.orientation == ReadEnds.R);
+                            if (useBarcodes) {
+                                ((ReadEndsForMarkDuplicatesWithBarcodes) pairedEnds).readOneBarcode = ((ReadEndsForMarkDuplicatesWithBarcodes) fragmentEnd).readOneBarcode;
+                            }
+                        } else {
+                            pairedEnds.orientationForOpticalDuplicates = ReadEnds.getOrientationByte(pairedEnds.orientation == ReadEnds.R, fragmentEnd.orientation == ReadEnds.R);
+                            if (useBarcodes) {
+                                ((ReadEndsForMarkDuplicatesWithBarcodes) pairedEnds).readOneBarcode = ((ReadEndsForMarkDuplicatesWithBarcodes) fragmentEnd).readTwoBarcode;
+                            }
+                        }
+
+                        // If the other read is actually later, simply add the other read's data as read2, else flip the reads
+                        if (matesRefIndex > pairedEnds.read1ReferenceIndex ||
+                                (matesRefIndex == pairedEnds.read1ReferenceIndex && matesCoordinate >= pairedEnds.read1Coordinate)) {
+                            pairedEnds.read2ReferenceIndex = matesRefIndex;
+                            pairedEnds.read2Coordinate = matesCoordinate;
+                            pairedEnds.read2IndexInFile = fragmentEnd.read1IndexInFile;
+                            pairedEnds.orientation = ReadEnds.getOrientationByte(pairedEnds.orientation == ReadEnds.R, fragmentEnd.orientation == ReadEnds.R);
+
+                            // if the two read ends are in the same position, pointing in opposite directions,
+                            // the orientation is undefined and the procedure above
+                            // will depend on the order of the reads in the file.
+                            // To avoid this, we set it explicitly (to FR):
+                            if (pairedEnds.read2ReferenceIndex == pairedEnds.read1ReferenceIndex &&
+                                    pairedEnds.read2Coordinate == pairedEnds.read1Coordinate &&
+                                    pairedEnds.orientation == ReadEnds.RF) {
+                                pairedEnds.orientation = ReadEnds.FR;
+                            }
+                        } else {
+                            pairedEnds.read2ReferenceIndex = pairedEnds.read1ReferenceIndex;
+                            pairedEnds.read2Coordinate = pairedEnds.read1Coordinate;
+                            pairedEnds.read2IndexInFile = pairedEnds.read1IndexInFile;
+                            pairedEnds.read1ReferenceIndex = matesRefIndex;
+                            pairedEnds.read1Coordinate = matesCoordinate;
+                            pairedEnds.read1IndexInFile = fragmentEnd.read1IndexInFile;
+                            pairedEnds.orientation = ReadEnds.getOrientationByte(fragmentEnd.orientation == ReadEnds.R,
+                                    pairedEnds.orientation == ReadEnds.R);
+                        }
+
+                        // pairedEnds.score += calcHelper.getReadDuplicateScore(rec, pairedEnds);
+                        pairedEnds.score += fragmentEnd.score;
+                        pairSort.add(pairedEnds);
+                    }
+                }
+                startingIndex += windows.get(idx).recordCount;
+            }
+        }
+        pairList.add(pairSort);
+        if (useMultithreading) log.info(tmp.size() + " pairs never matched.");
+        this.fragSort = new MergingIteratorForSortingCollections<>(fragList, new ReadEndsMDComparator(useBarcodes));
+        this.pairSort = new MergingIteratorForSortingCollections<>(pairList, new ReadEndsMDComparator(useBarcodes));
+
+        executor.shutdown();
+    }
+
+    private ThreadLocalReadEnds processWindowForReadEnds(@Nullable GenomicWindow window, boolean useBarcodes) {
+        long startTime = System.nanoTime();
+        final int sizeInBytes;
+        if (useBarcodes) {
+            sizeInBytes = ReadEndsForMarkDuplicatesWithBarcodes.getSizeOf();
+        } else {
+            sizeInBytes = ReadEndsForMarkDuplicates.getSizeOf();
+        }
+        int maxInMemory = (int) ((Runtime.getRuntime().maxMemory() * SORTING_COLLECTION_SIZE_RATIO) / sizeInBytes);
+        if (useMultithreading) maxInMemory /= windows.size();
         log.info("Will retain up to " + maxInMemory + " data points before spilling to disk.");
 
         final ReadEndsForMarkDuplicatesCodec fragCodec, pairCodec, diskCodec;
@@ -494,33 +936,43 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
             diskCodec = new ReadEndsForMarkDuplicatesCodec();
         }
 
-        this.pairSort = SortingCollection.newInstance(ReadEndsForMarkDuplicates.class,
+        SortingCollection<ReadEndsForMarkDuplicates> pairSort = SortingCollection.newInstance(ReadEndsForMarkDuplicates.class,
                 pairCodec,
                 new ReadEndsMDComparator(useBarcodes),
                 maxInMemory,
                 TMP_DIR);
 
-        this.fragSort = SortingCollection.newInstance(ReadEndsForMarkDuplicates.class,
+        SortingCollection<ReadEndsForMarkDuplicates> fragSort = SortingCollection.newInstance(ReadEndsForMarkDuplicates.class,
                 fragCodec,
                 new ReadEndsMDComparator(useBarcodes),
                 maxInMemory,
                 TMP_DIR);
 
+        Set<String> pgIdsSeen = new HashSet<>();
+
         final SamHeaderAndIterator headerAndIterator = openInputs(true);
         final SAMFileHeader.SortOrder assumedSortOrder = headerAndIterator.header.getSortOrder();
         final SAMFileHeader header = headerAndIterator.header;
-        final ReadEndsForMarkDuplicatesMap tmp = assumedSortOrder == SAMFileHeader.SortOrder.queryname ?
-                new MemoryBasedReadEndsForMarkDuplicatesMap() :  new DiskBasedReadEndsForMarkDuplicatesMap(MAX_FILE_HANDLES_FOR_READ_ENDS_MAP, diskCodec);
+        final ReadEndsForMarkDuplicatesMap tmp =
+                (useMultithreading || assumedSortOrder == SAMFileHeader.SortOrder.queryname)
+                        ? new SingleMemoryBasedReadEndsForMarkDuplicatesMap()
+                        : new DiskBasedReadEndsForMarkDuplicatesMap(MAX_FILE_HANDLES_FOR_READ_ENDS_MAP, diskCodec);
+
         long index = 0;
         final ProgressLogger progress = new ProgressLogger(log, (int) 1e6, "Read");
-        final CloseableIterator<SAMRecord> iterator = headerAndIterator.iterator;
-
-        if (null == this.libraryIdGenerator) {
-            this.libraryIdGenerator = new LibraryIdGenerator(header, flowBasedArguments.FLOW_MODE);
+        final CloseableIterator<SAMRecord> iterator;
+        if (useMultithreading) {
+            final SamReader reader = getReaders(false).get(0);
+            iterator = window.isUnmapped() ?
+                    reader.queryUnmapped() :
+                    reader.query(window.reference, window.start, window.end, false);
+            headerAndIterator.iterator.close();
         }
+        else iterator = headerAndIterator.iterator;
 
         String duplicateQueryName = null;
         long duplicateIndex = NO_SUCH_INDEX;
+
         while (iterator.hasNext()) {
             final SAMRecord rec = iterator.next();
 
@@ -551,7 +1003,7 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
             } else if (!rec.isSecondaryOrSupplementary()) {
                 final long indexForRead = assumedSortOrder == SAMFileHeader.SortOrder.queryname ? duplicateIndex : index;
                 final ReadEndsForMarkDuplicates fragmentEnd = calcHelper.buildReadEnds(header, indexForRead, rec, useBarcodes);
-                this.fragSort.add(fragmentEnd);
+                fragSort.add(fragmentEnd);
 
                 if (rec.getReadPairedFlag() && !rec.getMateUnmappedFlag()) {
                     final StringBuilder key = new StringBuilder();
@@ -564,6 +1016,10 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
                         // at this point pairedEnds and fragmentEnd are the same, but we need to make
                         // a copy since pairedEnds will be modified when the mate comes along.
                         pairedEnds = fragmentEnd.clone();
+                        if (useBarcodes) {
+                            ((ReadEndsForMarkDuplicatesWithBarcodes) pairedEnds).readOneBarcode = getReadOneBarcodeValue(rec);
+                            ((ReadEndsForMarkDuplicatesWithBarcodes) pairedEnds).readTwoBarcode = getReadTwoBarcodeValue(rec);
+                        }
                         tmp.put(pairedEnds.read2ReferenceIndex, key.toString(), pairedEnds);
                     } else {
                         final int matesRefIndex = fragmentEnd.read1ReferenceIndex;
@@ -612,8 +1068,8 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
                                     pairedEnds.orientation == ReadEnds.R);
                         }
 
-                        pairedEnds.score += calcHelper.getReadDuplicateScore(rec, pairedEnds);
-                        this.pairSort.add(pairedEnds);
+                        pairedEnds.score += fragmentEnd.score;
+                        pairSort.add(pairedEnds);
                     }
                 }
             }
@@ -625,12 +1081,24 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
             }
         }
 
+        // Set the correct record count for the current partition
+        if (window != null) window.setRecordCount(index);
+
         log.info("Read " + index + " records. " + tmp.size() + " pairs never matched.");
         iterator.close();
 
         // Tell these collections to free up memory if possible.
-        this.pairSort.doneAdding();
-        this.fragSort.doneAdding();
+        pairSort.doneAdding();
+        fragSort.doneAdding();
+        log.info("For building " + index + " records - took " + (System.nanoTime() - startTime) / 1_000_000_000 + " seconds.");
+        return new ThreadLocalReadEnds(pairSort, fragSort, tmp, pgIdsSeen);
+    }
+
+    private <T> void mergeCollection(SortingCollection<T> out, SortingCollection<T> in) {
+        for (final T v: in) out.add(v);
+    }
+    private <T> void mergeCollection(Set<T> out, Set<T> in) {
+        out.addAll(in);
     }
 
     /**
@@ -663,6 +1131,8 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
         ends.orientation = rec.getReadNegativeStrandFlag() ? ReadEnds.R : ReadEnds.F;
         ends.read1IndexInFile = index;
         ends.score = DuplicateScoringStrategy.computeDuplicateScore(rec, this.DUPLICATE_SCORING_STRATEGY);
+
+        if (rec.getFirstOfPairFlag()) ends.firstOfFlag = 1;
 
         // Doing this lets the ends object know that it's part of a pair
         if (rec.getReadPairedFlag() && !rec.getMateUnmappedFlag()) {
@@ -720,22 +1190,31 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
         }
         // Keep this number from getting too large even if there is a huge heap.
         int maxInMemory = (int) Math.min((Runtime.getRuntime().maxMemory() * 0.25) / entryOverhead, (double) (Integer.MAX_VALUE - 5));
+        if (useMultithreading) maxInMemory /= windows.size();
         // If we're also tracking optical duplicates, reduce maxInMemory, since we'll need two sorting collections
         if (indexOpticalDuplicates) {
             maxInMemory /= ((entryOverhead + SortingLongCollection.SIZEOF) / entryOverhead);
-            this.opticalDuplicateIndexes = new SortingLongCollection(maxInMemory, TMP_DIR.toArray(new File[TMP_DIR.size()]));
+            int finalMaxInMemory = maxInMemory;
+            this.opticalDuplicateIndexes = new GenomicPartitionedCollection<>(windows, () -> new SortingLongCollection(finalMaxInMemory, TMP_DIR.toArray(new File[0])));
         }
+
         log.info("Will retain up to " + maxInMemory + " duplicate indices before spilling to disk.");
-        this.duplicateIndexes = new SortingLongCollection(maxInMemory, TMP_DIR.toArray(new File[TMP_DIR.size()]));
+        int finalMaxInMemory = maxInMemory;
+        this.duplicateIndexes = new GenomicPartitionedCollection<>(windows, () -> new SortingLongCollection(finalMaxInMemory, TMP_DIR.toArray(new File[0])));
         if (TAG_DUPLICATE_SET_MEMBERS) {
             final RepresentativeReadIndexerCodec representativeIndexCodec = new RepresentativeReadIndexerCodec();
-            this.representativeReadIndicesForDuplicates = SortingCollection.newInstance(RepresentativeReadIndexer.class,
-                    representativeIndexCodec,
-                    Comparator.comparing(read -> read.readIndexInFile),
-                    maxInMemory,
-                    TMP_DIR);
+            this.representativeReadIndicesForDuplicates =
+                    new GenomicPartitionedCollection<>(windows,
+                            () -> SortingCollection.newInstance(
+                                    RepresentativeReadIndexer.class,
+                                    representativeIndexCodec,
+                                    Comparator.comparing(read -> read.readIndexInFile),
+                                    finalMaxInMemory,
+                                    TMP_DIR
+                            ));
         }
     }
+
     public void generateDuplicateIndexes(final boolean useBarcodes, final boolean indexOpticalDuplicates) {
         sortIndicesForDuplicates(indexOpticalDuplicates);
 
@@ -744,7 +1223,8 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
 
         // First just do the pairs
         log.info("Traversing read pair information and detecting duplicates.");
-        for (final ReadEndsForMarkDuplicates next : this.pairSort) {
+        while (this.pairSort.hasNext()) {
+            final ReadEndsForMarkDuplicates next = this.pairSort.next();
             if (firstOfNextChunk != null && areComparableForDuplicates(firstOfNextChunk, next, true, useBarcodes)) {
                 nextChunk.add(next);
             } else {
@@ -756,7 +1236,7 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
         }
         handleChunk(nextChunk);
 
-        this.pairSort.cleanup();
+        this.pairSort.close();
         this.pairSort = null;
 
         // Now deal with the fragments
@@ -766,7 +1246,8 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
 
         firstOfNextChunk = null;
 
-        for (final ReadEndsForMarkDuplicates next : this.fragSort) {
+        while (this.fragSort.hasNext()) {
+            final ReadEndsForMarkDuplicates next = this.fragSort.next();
             if (firstOfNextChunk != null && areComparableForDuplicates(firstOfNextChunk, next, false, useBarcodes)) {
                 nextChunk.add(next);
                 containsPairs = containsPairs || next.isPaired();
@@ -783,13 +1264,14 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
             }
         }
         markDuplicateFragments(nextChunk, containsPairs);
-        this.fragSort.cleanup();
+
+        this.fragSort.close();
         this.fragSort = null;
 
         log.info("Sorting list of duplicate records.");
-        this.duplicateIndexes.doneAddingStartIteration();
+        this.duplicateIndexes.doneAdding();
         if (this.opticalDuplicateIndexes != null) {
-            this.opticalDuplicateIndexes.doneAddingStartIteration();
+            this.opticalDuplicateIndexes.doneAdding();
         }
         if (TAG_DUPLICATE_SET_MEMBERS) {
             this.representativeReadIndicesForDuplicates.doneAdding();
@@ -973,6 +1455,194 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
                     addIndexAsDuplicate(end.read1IndexInFile);
                 }
             }
+        }
+    }
+
+    static class GenomicWindow {
+        final String reference;
+        final int start;
+        final int end;
+        long startingIndex;
+        long recordCount;
+        int windowIndex;
+
+        GenomicWindow(String reference, int start, int end, long startingIndex, long recordCount, int windowIndex) {
+            this.reference = reference;
+            this.start = start;
+            this.end = end;
+            this.startingIndex = startingIndex;
+            this.recordCount = recordCount;
+            this.windowIndex = windowIndex;
+        }
+
+        void setRecordCount(long recordCount) {
+            this.recordCount = recordCount;
+        }
+
+        boolean isUnmapped() {
+            return reference == null;
+        }
+
+        public void setStartingIndex(long startingIndex) {
+            this.startingIndex = startingIndex;
+        }
+    }
+
+    private class WindowResult {
+        final File tempFile;
+        final LibraryIdGenerator metrics;
+
+        WindowResult(File tempFile, LibraryIdGenerator metrics) {
+            this.tempFile = tempFile;
+            this.metrics = metrics;
+        }
+    }
+
+    private class ThreadLocalReadEnds {
+        final SortingCollection<ReadEndsForMarkDuplicates> localPairSort;
+        final SortingCollection<ReadEndsForMarkDuplicates> localFragSort;
+        final ReadEndsForMarkDuplicatesMap map;
+        Set<String> pgIdsSeen;
+
+        ThreadLocalReadEnds(SortingCollection<ReadEndsForMarkDuplicates> pairSort,
+                            SortingCollection<ReadEndsForMarkDuplicates> fragSort,
+                            ReadEndsForMarkDuplicatesMap map,
+                            Set<String> pgIdsSeen) {
+            this.localPairSort = pairSort;
+            this.localFragSort = fragSort;
+            this.map = map;
+            this.pgIdsSeen = pgIdsSeen;
+        }
+    }
+
+    class GenomicPartitionedCollection<T> {
+        private final List<T> collections;
+        private final List<GenomicWindow> windows;
+
+        public GenomicPartitionedCollection(List<GenomicWindow> windows, Supplier<T> collectionFactory) {
+            this.windows = windows;
+            this.collections = new ArrayList<>(Math.max(1, windows.size()));
+
+            // Create one collection per window, or just one if no windows
+            for (int i = 0; i < Math.max(1, windows.size()); i++) {
+                collections.add(collectionFactory.get());
+            }
+        }
+
+        public void add(Object value) {
+            long fileIndex;
+            if (value instanceof Long) {
+                fileIndex = (Long) value;
+            } else if (value instanceof RepresentativeReadIndexer) {
+                fileIndex = ((RepresentativeReadIndexer) value).readIndexInFile;
+            } else {
+                throw new IllegalArgumentException("Unsupported value type");
+            }
+
+            int partition = findPartition(fileIndex);
+            T collection = collections.get(partition);
+
+            // Handle different collection types
+            if (collection instanceof SortingLongCollection) {
+                ((SortingLongCollection) collection).add((Long) value);
+            } else if (collection instanceof SortingCollection) {
+                ((SortingCollection) collection).add(value);
+            }
+        }
+
+        public T getPartition(int index) {
+            return collections.get(index);
+        }
+
+        public void doneAdding() {
+            for (T collection : collections) {
+                if (collection instanceof SortingLongCollection) {
+                    ((SortingLongCollection) collection).doneAddingStartIteration();
+                } else if (collection instanceof SortingCollection) {
+                    ((SortingCollection) collection).doneAdding();
+                }
+            }
+        }
+
+        private int findPartition(long fileIndex) {
+            if (windows.isEmpty()) return 0;
+
+            for (int i = 0; i < windows.size(); i++) {
+                GenomicWindow window = windows.get(i);
+                if (fileIndex >= window.startingIndex &&
+                        fileIndex < window.startingIndex + window.recordCount) {
+                    return i;
+                }
+            }
+            throw new IllegalArgumentException("File index " + fileIndex +
+                    " does not belong to any window");
+        }
+    }
+
+    class BAMDensityUtil {
+        // Represents density information for a genomic region
+        static class DensityWindow {
+            final int start;
+            final int end;
+            final long estimatedReads;
+
+            DensityWindow(int start, int end, long estimatedReads) {
+                this.start = start;
+                this.end = end;
+                this.estimatedReads = estimatedReads;
+            }
+        }
+
+        // Get density windows for a reference sequence using level 2 bins (1Mb regions)
+        static List<DensityWindow> getDensityWindows(BAMIndex index, int referenceIndex, int sequenceLength) {
+            List<DensityWindow> densityWindows = new ArrayList<>();
+
+            if (!(index instanceof BrowseableBAMIndex)) {
+                return densityWindows;
+            }
+
+            BrowseableBAMIndex browseableIndex = (BrowseableBAMIndex)index;
+
+            // Calculate the first and last level 2 bin for this reference
+            int firstBinNum = AbstractBAMFileIndex.getFirstBinInLevel(2);
+            int lastBinNum = AbstractBAMFileIndex.getFirstBinInLevel(3) - 1;
+
+            // For each level 2 bin (1Mb regions)
+            for (int binNum = firstBinNum; binNum <= lastBinNum; binNum++) {
+                Bin bin = new Bin(referenceIndex, binNum);
+
+                // Get the genomic region this bin represents
+                int binStart = browseableIndex.getFirstLocusInBin(bin);
+                int binEnd = Math.min(browseableIndex.getLastLocusInBin(bin), sequenceLength);
+
+                if (binStart >= sequenceLength) break;
+
+                // Get overlapping region to find chunks
+                BAMFileSpan span = index.getSpanOverlapping(referenceIndex, binStart, binEnd);
+                if (span == null || span.getChunks() == null || span.getChunks().isEmpty()) continue;
+
+                // Estimate reads based on chunk sizes
+                long estimatedReads = 0;
+                for (Chunk chunk : span.getChunks()) {
+                    estimatedReads += (chunk.getChunkEnd() - chunk.getChunkStart());
+                }
+
+                if (estimatedReads > 0) {
+                    densityWindows.add(new DensityWindow(binStart, binEnd, estimatedReads));
+                }
+            }
+
+            return densityWindows;
+        }
+    }
+
+    private static class QueryNameComparator implements Comparator<ReadEndsWithName> {
+        public int compare(final ReadEndsWithName lhs, final ReadEndsWithName rhs) {
+            int compare = Integer.compare(lhs.readEnds.libraryId, rhs.readEnds.libraryId);
+            if (compare == 0) {
+                compare = lhs.readName.compareTo(rhs.readName);
+            }
+            return compare;
         }
     }
 

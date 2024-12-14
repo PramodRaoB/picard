@@ -267,6 +267,20 @@ public abstract class AbstractMarkDuplicatesCommandLineProgram extends AbstractO
         }
     }
 
+    protected List<SamReader> getReaders(boolean eagerlyDecode) {
+        final List<SamReader> readers = new ArrayList<>(INPUT.size());
+
+        for (final String input : INPUT) {
+            final SamReaderFactory readerFactory = SamReaderFactory.makeDefault();
+            if (eagerlyDecode) {
+                readerFactory.enable(SamReaderFactory.Option.EAGERLY_DECODE);
+            }
+            final SamReader reader = readerFactory.referenceSequence(REFERENCE_SEQUENCE).open(SamInputResource.of(input));
+            readers.add(reader);
+        }
+        return readers;
+    }
+
     /**
      * Looks through the set of reads and identifies how many of the duplicates are
      * in fact optical duplicates, and stores the data in the instance level histogram.

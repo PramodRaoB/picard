@@ -84,10 +84,10 @@ public class MarkDuplicatesForFlowHelper implements MarkDuplicatesHelper {
     public void generateDuplicateIndexes(final boolean useBarcodes, final boolean indexOpticalDuplicates) {
         md.sortIndicesForDuplicates(indexOpticalDuplicates);
         // this code does support pairs at this time
-        if ( md.pairSort.iterator().hasNext() ) {
+        if ( md.pairSort.hasNext() ) {
             throw new IllegalArgumentException("Flow based code does not support paired reads");
         }
-        md.pairSort.cleanup();
+        md.pairSort.close();
         md.pairSort = null;
 
         /**
@@ -114,7 +114,8 @@ public class MarkDuplicatesForFlowHelper implements MarkDuplicatesHelper {
         boolean containsPairs = false;
         boolean containsFrags = false;
 
-        for (final ReadEndsForMarkDuplicates next : md.fragSort) {
+        while (md.fragSort.hasNext()) {
+            final ReadEndsForMarkDuplicates next = md.fragSort.next();
             if (firstOfNextChunk != null && areComparableForDuplicatesWithEndSignificance(firstOfNextChunk, next, useBarcodes,
                     nextChunkRead1Coordinate2Min, nextChunkRead1Coordinate2Max, nextChunkRead1Coordinate1Min, nextChunkRead1Coordinate1Max)) {
                 nextChunk.add(next);
@@ -147,14 +148,15 @@ public class MarkDuplicatesForFlowHelper implements MarkDuplicatesHelper {
                 containsFrags = !next.isPaired();
             }
         }
+
         md.markDuplicateFragments(nextChunk, containsPairs);
-        md.fragSort.cleanup();
+        md.fragSort.close();
         md.fragSort = null;
 
         log.info("Sorting list of duplicate records.");
-        md.duplicateIndexes.doneAddingStartIteration();
+        md.duplicateIndexes.doneAdding();
         if (md.opticalDuplicateIndexes != null) {
-            md.opticalDuplicateIndexes.doneAddingStartIteration();
+            md.opticalDuplicateIndexes.doneAdding();
         }
         if (md.TAG_DUPLICATE_SET_MEMBERS) {
             md.representativeReadIndicesForDuplicates.doneAdding();
