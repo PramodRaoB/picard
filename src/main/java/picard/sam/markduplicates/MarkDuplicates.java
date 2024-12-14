@@ -501,6 +501,7 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
 
             while (iterator.hasNext()) {
                 final SAMRecord rec = iterator.next();
+                if (window != null && rec.getAlignmentStart() < window.start) continue;
 
                 DuplicationMetrics metrics = AbstractMarkDuplicatesCommandLineProgram.addReadToLibraryMetrics(rec, header, localMetrics, flowBasedArguments.FLOW_MODE);
 
@@ -835,11 +836,13 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
         }
         if (useMultithreading) {
             long startingIndex = 0;
+            long processedSequentially = 0;
             for (int idx = 0; idx < windows.size(); idx++) {
                 // Set the correct starting index for later steps
                 windows.get(idx).setStartingIndex(startingIndex);
                 SingleMemoryBasedReadEndsForMarkDuplicatesMap map = extraList.get(idx);
                 for (Map.Entry<String, ReadEndsForMarkDuplicates> entry : map.entrySet()) {
+                    processedSequentially++;
                     String key = entry.getKey();
                     ReadEndsForMarkDuplicates fragmentEnd = entry.getValue();
                     // Correct the index of this readEnd
@@ -904,6 +907,7 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
                 }
                 startingIndex += windows.get(idx).recordCount;
             }
+            log.info("Processed " + processedSequentially + " records sequentially.");
         }
         pairList.add(pairSort);
         if (useMultithreading) log.info(tmp.size() + " pairs never matched.");
