@@ -893,6 +893,11 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
         }
     }
 
+    public static int getThreadIndex() {
+        String name = Thread.currentThread().getName();
+        return Integer.parseInt(name.substring(name.lastIndexOf('-') + 1)) - 1;  // -1 to make it 0-based
+    }
+
     /**
      * Goes through all the records in a file and generates a set of ReadEndsForMarkDuplicates objects that
      * hold the necessary information (reference sequence, 5' read coordinate) to do
@@ -1065,7 +1070,7 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
             diskCodec = new ReadEndsForMarkDuplicatesCodec();
         }
 
-        int tid = (int) (Thread.currentThread().getId() % NUM_THREADS);
+        int tid = getThreadIndex();
         if (this.threadLocalPairSort.get(tid) == null) this.threadLocalPairSort.set(tid, SortingCollection.newInstance(
                 ReadEndsForMarkDuplicates.class,
                 pairCodec,
