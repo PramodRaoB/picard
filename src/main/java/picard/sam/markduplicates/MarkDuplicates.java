@@ -342,6 +342,8 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
             log.warn("Could not create processing windows. Proceeding with single-threaded exception.");
         } else {
             log.info("Created " + windows.size() + " processing windows");
+            // Sort the windows even though currently we only have approximate record counts
+            windows.sort((w1, w2) -> Long.compare(w2.recordCount, w1.recordCount));
         }
         log.info("Reading input file and constructing read end information.");
         OperationTimer.start("Building sorted read end lists");
@@ -952,7 +954,7 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
                 TMP_DIR);
         try {
             for (Future<ReadEndsForMarkDuplicatesMap> future : futures) {
-                if (useMultithreading) extraList.add((SingleMemoryBasedReadEndsForMarkDuplicatesMap) future.get());
+                extraList.add((SingleMemoryBasedReadEndsForMarkDuplicatesMap) future.get());
             }
         } catch (Exception e) {
             throw new PicardException("Error processing windows", e);
@@ -1088,7 +1090,7 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
         if (this.threadLocalPGIds.get(tid) == null) this.threadLocalPGIds.set(tid, new HashSet<>());
 
         SortingCollection<ReadEndsForMarkDuplicates> pairSort = this.threadLocalPairSort.get(tid);
-        SortingCollection<ReadEndsForMarkDuplicates> fragSort = this.threadLocalPairSort.get(tid);
+        SortingCollection<ReadEndsForMarkDuplicates> fragSort = this.threadLocalFragSort.get(tid);
         Set<String> pgIdsSeen = this.threadLocalPGIds.get(tid);
 
         final SamHeaderAndIterator headerAndIterator = openInputs(true);
