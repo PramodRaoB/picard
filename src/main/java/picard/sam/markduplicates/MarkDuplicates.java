@@ -236,6 +236,9 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
     protected GenomicPartitionedCollection<SortingLongCollection> opticalDuplicateIndexes;
     protected GenomicPartitionedCollection<SortingCollection<RepresentativeReadIndexer>> representativeReadIndicesForDuplicates;
     protected List<GenomicWindow> windows;
+    private List<SortingCollection<ReadEndsForMarkDuplicates>> threadLocalPairSort;
+    private List<SortingCollection<ReadEndsForMarkDuplicates>> threadLocalFragSort;
+    private List<Set<String>> threadLocalPGIds;
     private Long totalRecords = 0L;
     private Long targetReadsPerChunk;
     private boolean useMultithreading;
@@ -924,7 +927,7 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
         }
 
         ExecutorService executor = Executors.newFixedThreadPool(NUM_THREADS);
-        List<Future<ThreadLocalReadEnds>> futures = new ArrayList<>();
+        List<Future<ReadEndsForMarkDuplicatesMap>> futures = new ArrayList<>();
 
         for (GenomicWindow window : windows) {
             futures.add(executor.submit(() -> processWindowForReadEnds(window, useBarcodes)));
@@ -932,8 +935,9 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
 
         if (!useMultithreading) futures.add(executor.submit(() -> processWindowForReadEnds(null, useBarcodes)));
         headerAndIterator.iterator.close();
-        List<SortingCollection<ReadEndsForMarkDuplicates>> fragList = new ArrayList<>();
-        List<SortingCollection<ReadEndsForMarkDuplicates>> pairList = new ArrayList<>();
+        this.threadLocalFragSort = new ArrayList<>(Collections.nCopies(Math.max(windows.size(), 1), null));
+        this.threadLocalPairSort = new ArrayList<>(Collections.nCopies(Math.max(windows.size(), 1), null));
+        this.threadLocalPGIds = new ArrayList<>(Collections.nCopies(Math.max(windows.size(), 1), null));
         List<SingleMemoryBasedReadEndsForMarkDuplicatesMap> extraList = new ArrayList<>();
 
         SortingCollection<ReadEndsForMarkDuplicates> pairSort = SortingCollection.newInstance(ReadEndsForMarkDuplicates.class,
@@ -942,12 +946,8 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
                 maxInMemory,
                 TMP_DIR);
         try {
-            for (Future<ThreadLocalReadEnds> future : futures) {
-                ThreadLocalReadEnds threadResults = future.get();
-                fragList.add(threadResults.localFragSort);
-                pairList.add(threadResults.localPairSort);
-                mergeCollection(this.pgIdsSeen, threadResults.pgIdsSeen);
-                if (useMultithreading) extraList.add((SingleMemoryBasedReadEndsForMarkDuplicatesMap) threadResults.map);
+            for (Future<ReadEndsForMarkDuplicatesMap> future : futures) {
+                if (useMultithreading) extraList.add((SingleMemoryBasedReadEndsForMarkDuplicatesMap) future.get());
             }
         } catch (Exception e) {
             throw new PicardException("Error processing windows", e);
@@ -1031,15 +1031,19 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
             }
             log.info("Processed " + processedSequentially + " records sequentially.");
         }
-        pairList.add(pairSort);
+        this.threadLocalPairSort.add(pairSort);
         if (useMultithreading) log.info(tmp.size() + " pairs never matched.");
-        this.fragSort = new MergingIteratorForSortingCollections<>(fragList, new ReadEndsMDComparator(useBarcodes));
-        this.pairSort = new MergingIteratorForSortingCollections<>(pairList, new ReadEndsMDComparator(useBarcodes));
+        log.info("Merging built read end lists");
+        for (SortingCollection<ReadEndsForMarkDuplicates> col : this.threadLocalPairSort) col.doneAdding();
+        for (SortingCollection<ReadEndsForMarkDuplicates> col : this.threadLocalFragSort) col.doneAdding();
+        for (Set<String> st : this.threadLocalPGIds) mergeCollection(this.pgIdsSeen, st);
+        this.fragSort = new MergingIteratorForSortingCollections<>(threadLocalFragSort, new ReadEndsMDComparator(useBarcodes));
+        this.pairSort = new MergingIteratorForSortingCollections<>(threadLocalPairSort, new ReadEndsMDComparator(useBarcodes));
 
         executor.shutdown();
     }
 
-    private ThreadLocalReadEnds processWindowForReadEnds(@Nullable GenomicWindow window, boolean useBarcodes) {
+    private ReadEndsForMarkDuplicatesMap processWindowForReadEnds(@Nullable GenomicWindow window, boolean useBarcodes) {
         long startTime = System.nanoTime();
         final int sizeInBytes;
         if (useBarcodes) {
@@ -1062,19 +1066,24 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
             diskCodec = new ReadEndsForMarkDuplicatesCodec();
         }
 
-        SortingCollection<ReadEndsForMarkDuplicates> pairSort = SortingCollection.newInstance(ReadEndsForMarkDuplicates.class,
+        int tid = Thread.currentThread().getId();
+
+        SortingCollection<ReadEndsForMarkDuplicates> pairSort = this.threadLocalPairSort.get(tid);
+        if (pairSort == null) pairSort = SortingCollection.newInstance(ReadEndsForMarkDuplicates.class,
                 pairCodec,
                 new ReadEndsMDComparator(useBarcodes),
                 maxInMemory,
                 TMP_DIR);
 
-        SortingCollection<ReadEndsForMarkDuplicates> fragSort = SortingCollection.newInstance(ReadEndsForMarkDuplicates.class,
+        SortingCollection<ReadEndsForMarkDuplicates> fragSort = this.threadLocalPairSort.get(tid);
+        if (fragSort == null) fragSort = SortingCollection.newInstance(ReadEndsForMarkDuplicates.class,
                 fragCodec,
                 new ReadEndsMDComparator(useBarcodes),
                 maxInMemory,
                 TMP_DIR);
 
-        Set<String> pgIdsSeen = new HashSet<>();
+        Set<String> pgIdsSeen = this.threadLocalPGIds.get(tid);
+        if (pgIdsSeen == null) pgIdsSeen = new HashSet<>();
 
         final SamHeaderAndIterator headerAndIterator = openInputs(true);
         final SAMFileHeader.SortOrder assumedSortOrder = headerAndIterator.header.getSortOrder();
@@ -1214,11 +1223,8 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
         log.info("Read " + index + " records. " + tmp.size() + " pairs never matched.");
         iterator.close();
 
-        // Tell these collections to free up memory if possible.
-        pairSort.doneAdding();
-        fragSort.doneAdding();
         log.info("For building " + index + " records - took " + (System.nanoTime() - startTime) / 1_000_000_000 + " seconds.");
-        return new ThreadLocalReadEnds(pairSort, fragSort, tmp, pgIdsSeen);
+        return tmp;
     }
 
     private <T> void mergeCollection(SortingCollection<T> out, SortingCollection<T> in) {
