@@ -935,9 +935,9 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
 
         if (!useMultithreading) futures.add(executor.submit(() -> processWindowForReadEnds(null, useBarcodes)));
         headerAndIterator.iterator.close();
-        this.threadLocalFragSort = new ArrayList<>(Collections.nCopies(Math.max(windows.size(), 1), null));
-        this.threadLocalPairSort = new ArrayList<>(Collections.nCopies(Math.max(windows.size(), 1), null));
-        this.threadLocalPGIds = new ArrayList<>(Collections.nCopies(Math.max(windows.size(), 1), null));
+        this.threadLocalFragSort = new ArrayList<>(Collections.nCopies(Math.max(NUM_THREADS, 1), null));
+        this.threadLocalPairSort = new ArrayList<>(Collections.nCopies(Math.max(NUM_THREADS, 1), null));
+        this.threadLocalPGIds = new ArrayList<>(Collections.nCopies(Math.max(NUM_THREADS, 1), null));
         List<SingleMemoryBasedReadEndsForMarkDuplicatesMap> extraList = new ArrayList<>();
 
         SortingCollection<ReadEndsForMarkDuplicates> pairSort = SortingCollection.newInstance(ReadEndsForMarkDuplicates.class,
@@ -1066,7 +1066,7 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
             diskCodec = new ReadEndsForMarkDuplicatesCodec();
         }
 
-        int tid = Thread.currentThread().getId();
+        int tid = (int) Thread.currentThread().getId();
 
         SortingCollection<ReadEndsForMarkDuplicates> pairSort = this.threadLocalPairSort.get(tid);
         if (pairSort == null) pairSort = SortingCollection.newInstance(ReadEndsForMarkDuplicates.class,
