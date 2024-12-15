@@ -1066,7 +1066,7 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
             diskCodec = new ReadEndsForMarkDuplicatesCodec();
         }
 
-        int tid = (int) Thread.currentThread().getId();
+        int tid = (int) (Thread.currentThread().getId() % NUM_THREADS);
 
         SortingCollection<ReadEndsForMarkDuplicates> pairSort = this.threadLocalPairSort.get(tid);
         if (pairSort == null) pairSort = SortingCollection.newInstance(ReadEndsForMarkDuplicates.class,
