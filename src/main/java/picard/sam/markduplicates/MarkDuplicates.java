@@ -921,6 +921,10 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
         if (useBarcodes) diskCodec = new ReadEndsForMarkDuplicatesWithBarcodesCodec();
         else diskCodec = new ReadEndsForMarkDuplicatesCodec();
         final ReadEndsForMarkDuplicatesMap tmp = useMultithreading ? new DiskBasedReadEndsForMarkDuplicatesMap(MAX_FILE_HANDLES_FOR_READ_ENDS_MAP, diskCodec) : null;
+        this.threadLocalFragSort = new ArrayList<>(Collections.nCopies(NUM_THREADS, null));
+        this.threadLocalPairSort = new ArrayList<>(Collections.nCopies(NUM_THREADS, null));
+        this.threadLocalPGIds = new ArrayList<>(Collections.nCopies(NUM_THREADS, null));
+        List<SingleMemoryBasedReadEndsForMarkDuplicatesMap> extraList = new ArrayList<>();
 
         if (null == this.libraryIdGenerator) {
             this.libraryIdGenerator = new LibraryIdGenerator(header, flowBasedArguments.FLOW_MODE);
@@ -935,10 +939,6 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
 
         if (!useMultithreading) futures.add(executor.submit(() -> processWindowForReadEnds(null, useBarcodes)));
         headerAndIterator.iterator.close();
-        this.threadLocalFragSort = new ArrayList<>(Collections.nCopies(Math.max(NUM_THREADS, 1), null));
-        this.threadLocalPairSort = new ArrayList<>(Collections.nCopies(Math.max(NUM_THREADS, 1), null));
-        this.threadLocalPGIds = new ArrayList<>(Collections.nCopies(Math.max(NUM_THREADS, 1), null));
-        List<SingleMemoryBasedReadEndsForMarkDuplicatesMap> extraList = new ArrayList<>();
 
         SortingCollection<ReadEndsForMarkDuplicates> pairSort = SortingCollection.newInstance(ReadEndsForMarkDuplicates.class,
                 pairCodec,
