@@ -38,7 +38,9 @@ import picard.sam.markduplicates.util.*;
 import picard.sam.util.RepresentativeReadIndexer;
 
 import javax.annotation.Nullable;
+import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileReader;
 import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.ExecutorService;
@@ -222,6 +224,9 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
     @Argument(doc = "Number of reader/writer threads to use. Note that an index file is required for actually multithreading")
     public int NUM_THREADS = 1;
 
+    @Argument(doc = "Optional bedGraph file (e.g. STAR Signal.Unique.str1.out.bg) to use for coverage-aware partitioning", optional = true)
+    public String COVERAGE_BEDGRAPH = null;
+
     @ArgumentCollection
     public MarkDuplicatesForFlowArgumentCollection flowBasedArguments = new MarkDuplicatesForFlowArgumentCollection();
 
@@ -232,6 +237,7 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
     protected GenomicPartitionedCollection<SortingCollection<RepresentativeReadIndexer>> representativeReadIndicesForDuplicates;
     protected List<GenomicWindow> windows;
     private Long totalRecords = 0L;
+    private Long targetReadsPerChunk;
     private boolean useMultithreading;
 
     // some calculations are performed using a helper class, which can be parameter specific
@@ -639,6 +645,8 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
         List<GenomicWindow> windows = new ArrayList<>();
         long currentIndex = 0;
         boolean metaNotFound = false;
+        int cnt = 0;
+        long unmappedCount = 0L;
 
         try (SamReader reader = SamReaderFactory.makeDefault()
                 .enable(SamReaderFactory.Option.CACHE_FILE_BASED_INDEXES)
@@ -647,10 +655,26 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
             if (reader.hasIndex()) {
                 BAMIndex index = reader.indexing().getIndex();
                 SAMFileHeader header = reader.getFileHeader();
-                long unmappedCount = 0;
+                for (int i = 0; i < header.getSequenceDictionary().size(); i++) {
+                    BAMIndexMetaData metaData = index.getMetaData(i);
+                    if (metaData != null) totalRecords += metaData.getAlignedRecordCount();
+                    else {
+                        log.info("Metadata not found for reference: " + header.getSequence(i).getSequenceName());
+                        metaNotFound = true;
+                        break;
+                    }
+                }
+                targetReadsPerChunk = totalRecords / NUM_THREADS / 2;
 
                 log.info("Number of reference sequences: " + header.getSequenceDictionary().size());
-                int cnt = 0;
+                CoverageAwareWindowCalculator cov = null;
+                if (COVERAGE_BEDGRAPH != null) {
+                    // Option to more accurately split windows
+                    try {
+                        cov = new CoverageAwareWindowCalculator();
+                        cov.parseCoverageInformation(COVERAGE_BEDGRAPH);
+                    } catch (IOException ignored) {}
+                }
                 for (int i = 0; i < header.getSequenceDictionary().size(); i++) {
                     SAMSequenceRecord seq = header.getSequence(i);
                     BAMIndexMetaData metadata = index.getMetaData(i);
@@ -669,11 +693,10 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
                             );
                             currentIndex += mappedReads;
                             // Split large windows based on density
-                            List<GenomicWindow> splitWindows = splitGenomicWindow(window, cnt, index, i);
+                            List<GenomicWindow> splitWindows = splitGenomicWindow(window, cnt, index, i, cov);
                             windows.addAll(splitWindows);
                             cnt += splitWindows.size();
                         }
-                        this.totalRecords += mappedReads;
                         unmappedCount += unmappedForRef;
                     } else {
                         log.info("Metadata not found for reference: " + seq.getSequenceName());
@@ -699,8 +722,103 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
         return windows;
     }
 
+    private class CoverageAwareWindowCalculator {
+        private class CoverageRegion {
+            final int start;
+            final int end;
+            final double coverage;
 
-    private List<GenomicWindow> splitGenomicWindow(GenomicWindow window, int windowStartIndex, BAMIndex index, int refIndex) {
+            CoverageRegion(int start, int end, double coverage) {
+                this.start = start;
+                this.end = end;
+                this.coverage = coverage;
+            }
+
+            long getTotalCoverage() {
+                return (long)(coverage * (end - start));
+            }
+        }
+
+        Map<String, List<CoverageRegion>> coverageByChrom;
+
+        public void parseCoverageInformation(String bedGraphFile) throws IOException {
+            this.coverageByChrom = new HashMap<>();
+
+            // Parse bedGraph file
+            BufferedReader reader = new BufferedReader(new FileReader(bedGraphFile));
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (line.startsWith("track")) continue;
+
+                String[] parts = line.trim().split("\\s+");
+                String chrom = parts[0];
+                int start = Integer.parseInt(parts[1]);
+                int end = Integer.parseInt(parts[2]);
+                double coverage = Double.parseDouble(parts[3]);
+
+                if (coverage > 0) {
+                    coverageByChrom
+                            .computeIfAbsent(chrom, k -> new ArrayList<>())
+                            .add(new CoverageRegion(start, end, coverage));
+                }
+            }
+        }
+
+        public List<GenomicWindow> calculateWindows(GenomicWindow window, int windowIndex) {
+            List<GenomicWindow> windows = new ArrayList<>();
+            long currentIndex = 0;
+
+            List<CoverageRegion> regions = coverageByChrom.getOrDefault(window.reference, Collections.emptyList());
+            if (regions.isEmpty()) return windows;
+
+            // Calculate total coverage for this chromosome
+            double totalCoverage = regions.stream()
+                    .mapToDouble(CoverageRegion::getTotalCoverage)
+                    .sum();
+
+            int numWindows = (int) ((double) window.recordCount / targetReadsPerChunk);
+
+            // Calculate target coverage per window
+            double targetCoveragePerWindow = totalCoverage / numWindows;
+
+            int genomeStart = regions.get(0).start;
+
+            int currentStart = genomeStart;
+            double accumulatedCoverage = 0;
+            int regionIndex = 0;
+
+            // Create windows based on coverage
+            while (regionIndex < regions.size()) {
+                CoverageRegion region = regions.get(regionIndex);
+                accumulatedCoverage += region.getTotalCoverage();
+
+                if (accumulatedCoverage >= targetCoveragePerWindow || regionIndex == regions.size() - 1) {
+                    // Create window
+                    int windowEnd = region.end;
+                    windows.add(new MarkDuplicates.GenomicWindow(
+                            window.reference,
+                            currentStart,
+                            windowEnd,
+                            currentIndex, // Approximate
+                            (long) accumulatedCoverage, // Approximate
+                            windowIndex++
+                    ));
+
+                    currentStart = windowEnd + 1;
+                    currentIndex += accumulatedCoverage;
+                    accumulatedCoverage = 0;
+                }
+                regionIndex++;
+            }
+
+            return windows;
+        }
+    }
+
+    private List<GenomicWindow> splitGenomicWindow(GenomicWindow window, int windowStartIndex, BAMIndex index, int refIndex, @Nullable CoverageAwareWindowCalculator cov) {
+        if (cov != null) {
+            return cov.calculateWindows(window, windowStartIndex);
+        }
         List<GenomicWindow> windows = new ArrayList<>();
         final long TARGET_RECORDS_PER_WINDOW = 3_000_000L;
 
@@ -837,7 +955,11 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
         if (useMultithreading) {
             long startingIndex = 0;
             long processedSequentially = 0;
+            long cnt = 0;
+            for (int idx = 0; idx < windows.size(); idx++) cnt += extraList.get(idx).size();
+            log.info("Going to process " + cnt + " records sequentially");
             for (int idx = 0; idx < windows.size(); idx++) {
+                log.info("Starting index " + idx + " with size: " + extraList.get(idx).size());
                 // Set the correct starting index for later steps
                 windows.get(idx).setStartingIndex(startingIndex);
                 SingleMemoryBasedReadEndsForMarkDuplicatesMap map = extraList.get(idx);
@@ -979,6 +1101,7 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
 
         while (iterator.hasNext()) {
             final SAMRecord rec = iterator.next();
+            if (window != null && rec.getAlignmentStart() < window.start) continue;
 
             // This doesn't have anything to do with building sorted ReadEnd lists, but it can be done in the same pass
             // over the input
