@@ -38,6 +38,7 @@ public class MergingIteratorForSortingCollections<T> implements CloseableIterato
         int n = 0;
         log.debug(String.format("Creating merging iterator from %d collections", collections.size()));
         for (SortingCollection<T> collection : collections) {
+            if (collection == null) continue;
             CloseableIterator<T> iterator = collection.iterator();
             if (iterator.hasNext()) {
                 queue.add(new PeekSortingCollectionIterator(iterator, n++));
@@ -84,7 +85,7 @@ public class MergingIteratorForSortingCollections<T> implements CloseableIterato
                 PeekSortingCollectionIterator iterator = queue.pollFirst();
                 ((CloseableIterator<T>) iterator.getUnderlyingIterator()).close();
             }
-            for (SortingCollection<T> collection: this.collections) collection.cleanup();
+            for (SortingCollection<T> collection: this.collections) if (collection != null) collection.cleanup();
             isClosed = true;
         }
     }

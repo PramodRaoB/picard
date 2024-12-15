@@ -1034,9 +1034,9 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
         this.threadLocalPairSort.add(pairSort);
         if (useMultithreading) log.info(tmp.size() + " pairs never matched.");
         log.info("Merging built read end lists");
-        for (SortingCollection<ReadEndsForMarkDuplicates> col : this.threadLocalPairSort) col.doneAdding();
-        for (SortingCollection<ReadEndsForMarkDuplicates> col : this.threadLocalFragSort) col.doneAdding();
-        for (Set<String> st : this.threadLocalPGIds) mergeCollection(this.pgIdsSeen, st);
+        for (SortingCollection<ReadEndsForMarkDuplicates> col : this.threadLocalPairSort) if (col != null) col.doneAdding();
+        for (SortingCollection<ReadEndsForMarkDuplicates> col : this.threadLocalFragSort) if (col != null) col.doneAdding();
+        for (Set<String> st : this.threadLocalPGIds) if (st != null) mergeCollection(this.pgIdsSeen, st);
         this.fragSort = new MergingIteratorForSortingCollections<>(threadLocalFragSort, new ReadEndsMDComparator(useBarcodes));
         this.pairSort = new MergingIteratorForSortingCollections<>(threadLocalPairSort, new ReadEndsMDComparator(useBarcodes));
 
