@@ -959,7 +959,6 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
             for (int idx = 0; idx < windows.size(); idx++) cnt += extraList.get(idx).size();
             log.info("Going to process " + cnt + " records sequentially");
             for (int idx = 0; idx < windows.size(); idx++) {
-                log.info("Starting index " + idx + " with size: " + extraList.get(idx).size());
                 // Set the correct starting index for later steps
                 windows.get(idx).setStartingIndex(startingIndex);
                 SingleMemoryBasedReadEndsForMarkDuplicatesMap map = extraList.get(idx);
@@ -1067,23 +1066,25 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
         }
 
         int tid = (int) (Thread.currentThread().getId() % NUM_THREADS);
-
-        SortingCollection<ReadEndsForMarkDuplicates> pairSort = this.threadLocalPairSort.get(tid);
-        if (pairSort == null) pairSort = SortingCollection.newInstance(ReadEndsForMarkDuplicates.class,
+        if (this.threadLocalPairSort.get(tid) == null) this.threadLocalPairSort.set(tid, SortingCollection.newInstance(
+                ReadEndsForMarkDuplicates.class,
                 pairCodec,
                 new ReadEndsMDComparator(useBarcodes),
                 maxInMemory,
-                TMP_DIR);
-
-        SortingCollection<ReadEndsForMarkDuplicates> fragSort = this.threadLocalPairSort.get(tid);
-        if (fragSort == null) fragSort = SortingCollection.newInstance(ReadEndsForMarkDuplicates.class,
+                TMP_DIR
+        ));
+        if (this.threadLocalFragSort.get(tid) == null) this.threadLocalFragSort.set(tid, SortingCollection.newInstance(
+                ReadEndsForMarkDuplicates.class,
                 fragCodec,
                 new ReadEndsMDComparator(useBarcodes),
                 maxInMemory,
-                TMP_DIR);
+                TMP_DIR
+        ));
+        if (this.threadLocalPGIds.get(tid) == null) this.threadLocalPGIds.set(tid, new HashSet<>());
 
+        SortingCollection<ReadEndsForMarkDuplicates> pairSort = this.threadLocalPairSort.get(tid);
+        SortingCollection<ReadEndsForMarkDuplicates> fragSort = this.threadLocalPairSort.get(tid);
         Set<String> pgIdsSeen = this.threadLocalPGIds.get(tid);
-        if (pgIdsSeen == null) pgIdsSeen = new HashSet<>();
 
         final SamHeaderAndIterator headerAndIterator = openInputs(true);
         final SAMFileHeader.SortOrder assumedSortOrder = headerAndIterator.header.getSortOrder();
