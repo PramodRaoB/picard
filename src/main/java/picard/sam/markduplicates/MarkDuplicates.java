@@ -348,6 +348,9 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
         log.info("Reading input file and constructing read end information.");
         OperationTimer.start("Building sorted read end lists");
         buildSortedReadEndLists(useBarcodes);
+        for (GenomicWindow window : windows) {
+            log.info("Window had " + window.recordCount);
+        }
         if (useMultithreading) windows.sort((w1, w2) -> Long.compare(w2.recordCount, w1.recordCount));
         OperationTimer.stop("Building sorted read end lists");
         reportMemoryStats("After buildSortedReadEndLists");
@@ -676,8 +679,10 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
                 if (COVERAGE_BEDGRAPH != null) {
                     // Option to more accurately split windows
                     try {
+                        OperationTimer.start("Parsing bedgraph");
                         cov = new CoverageAwareWindowCalculator();
                         cov.parseCoverageInformation(COVERAGE_BEDGRAPH);
+                        OperationTimer.stop("Parsing bedgraph");
                     } catch (IOException ignored) {}
                 }
                 for (int i = 0; i < header.getSequenceDictionary().size(); i++) {
@@ -742,6 +747,10 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
             long getTotalCoverage() {
                 return (long)(coverage * (end - start));
             }
+
+            int getLength() {
+                return end - start + 1;
+            }
         }
 
         Map<String, List<CoverageRegion>> coverageByChrom;
@@ -786,32 +795,38 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
             // Calculate target coverage per window
             double targetCoveragePerWindow = totalCoverage / numWindows;
 
-            int genomeStart = regions.get(0).start;
-
-            int currentStart = genomeStart;
-            double accumulatedCoverage = 0;
+            int currentStart = regions.get(0).start;
+            double accumulatedCoverage = 0, previousCoverage = 0;
             int regionIndex = 0;
+
+            double targetCoverage = targetCoveragePerWindow;
 
             // Create windows based on coverage
             while (regionIndex < regions.size()) {
                 CoverageRegion region = regions.get(regionIndex);
                 accumulatedCoverage += region.getTotalCoverage();
 
-                if (accumulatedCoverage >= targetCoveragePerWindow || regionIndex == regions.size() - 1) {
+                if (accumulatedCoverage >= targetCoverage || regionIndex == regions.size() - 1) {
                     // Create window
                     int windowEnd = region.end;
+                    double overshoot = accumulatedCoverage - targetCoverage;
+                    if (regionIndex != regions.size() - 1) {
+                        int basesToSubtract = (int) (overshoot / region.getTotalCoverage() * region.getLength());
+                        windowEnd = Math.max(currentStart, windowEnd - basesToSubtract);
+                    }
                     windows.add(new MarkDuplicates.GenomicWindow(
                             window.reference,
                             currentStart,
                             windowEnd,
                             currentIndex, // Approximate
-                            (long) accumulatedCoverage, // Approximate
+                            (long) (accumulatedCoverage - previousCoverage), // Approximate
                             windowIndex++
                     ));
+                    targetCoverage += targetCoveragePerWindow;
 
                     currentStart = windowEnd + 1;
-                    currentIndex += accumulatedCoverage;
-                    accumulatedCoverage = 0;
+                    currentIndex += accumulatedCoverage - overshoot;
+                    previousCoverage = accumulatedCoverage - overshoot;
                 }
                 regionIndex++;
             }
