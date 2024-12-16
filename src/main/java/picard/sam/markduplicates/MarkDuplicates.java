@@ -239,6 +239,7 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
     private Long totalRecords = 0L;
     private Long targetReadsPerChunk;
     private boolean useMultithreading;
+    private List<Integer> windowIndexToIndex;
 
     // some calculations are performed using a helper class, which can be parameter specific
     // by default, this instance is the helper
@@ -341,6 +342,7 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
             log.info("Created " + windows.size() + " processing windows");
             // Sort the windows even though currently we only have approximate record counts
             windows.sort((w1, w2) -> Long.compare(w2.recordCount, w1.recordCount));
+            windowIndexToIndex = new ArrayList<>(Collections.nCopies(windows.size(), 0));
         }
         log.info("Reading input file and constructing read end information.");
         OperationTimer.start("Building sorted read end lists");
@@ -349,6 +351,12 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
             log.info("Window had " + window.recordCount);
         }
         if (useMultithreading) windows.sort((w1, w2) -> Long.compare(w2.recordCount, w1.recordCount));
+        // Update window-index to index mapping (CRUCIAL)
+        for (int idx = 0; idx < windows.size(); idx++) {
+            GenomicWindow window = windows.get(idx);
+            log.info("Window has " + window.recordCount);
+            windowIndexToIndex.set(window.windowIndex, idx);
+        }
         OperationTimer.stop("Building sorted read end lists");
         reportMemoryStats("After buildSortedReadEndLists");
         OperationTimer.start("Generating duplicate indexes");
@@ -362,10 +370,6 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
             log.warn("Skipped optical duplicate cluster discovery; library size estimation may be inaccurate!");
         } else {
             log.info("Found " + (this.libraryIdGenerator.getNumberOfOpticalDuplicateClusters()) + " optical duplicate clusters.");
-        }
-
-        for (GenomicWindow window : windows) {
-            log.info("Window has " + window.recordCount);
         }
 
         final SamHeaderAndIterator headerAndIterator = openInputs(false);
@@ -1050,8 +1054,7 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
                     if (pairedEnds == null) {
                         // at this point pairedEnds and fragmentEnd are the same, but we need to make
                         // a copy since pairedEnds will be modified when the mate comes along.
-                        pairedEnds = fragmentEnd.clone();
-                        tmp.put(pairedEnds.read2ReferenceIndex, key.toString(), pairedEnds);
+                        tmp.put(fragmentEnd.read2ReferenceIndex, key.toString(), fragmentEnd);
                     } else {
                         final int matesRefIndex = fragmentEnd.read1ReferenceIndex;
                         final int matesCoordinate = fragmentEnd.read1Coordinate;
@@ -1125,7 +1128,7 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
     private ReadEndsForMarkDuplicatesMap processWindowForReadEnds(@Nullable GenomicWindow window, boolean useBarcodes) {
         long startTime = System.nanoTime();
         final int sizeInBytes;
-        final int windowIndex = window != null ? window.windowIndex : 0;
+        final int windowIndex = window != null ? window.windowIndex : -1;
         if (useBarcodes) {
             sizeInBytes = ReadEndsForMarkDuplicatesWithBarcodes.getSizeOf();
         } else {
@@ -1498,7 +1501,7 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
 
     private void updateIndexInFile(ReadEndsForMarkDuplicates end) {
         if (end.windowIndex == -1) return;
-        final GenomicWindow window = windows.get(end.windowIndex);
+        final GenomicWindow window = windows.get(windowIndexToIndex.get(end.windowIndex));
         if (end.read1IndexInFile < window.startingIndex) {
             end.read1IndexInFile += window.startingIndex;
             end.read2IndexInFile += window.startingIndex;
@@ -1722,23 +1725,6 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
         WindowResult(File tempFile, LibraryIdGenerator metrics) {
             this.tempFile = tempFile;
             this.metrics = metrics;
-        }
-    }
-
-    private class ThreadLocalReadEnds {
-        final SortingCollection<ReadEndsForMarkDuplicates> localPairSort;
-        final SortingCollection<ReadEndsForMarkDuplicates> localFragSort;
-        final ReadEndsForMarkDuplicatesMap map;
-        Set<String> pgIdsSeen;
-
-        ThreadLocalReadEnds(SortingCollection<ReadEndsForMarkDuplicates> pairSort,
-                            SortingCollection<ReadEndsForMarkDuplicates> fragSort,
-                            ReadEndsForMarkDuplicatesMap map,
-                            Set<String> pgIdsSeen) {
-            this.localPairSort = pairSort;
-            this.localFragSort = fragSort;
-            this.map = map;
-            this.pgIdsSeen = pgIdsSeen;
         }
     }
 
