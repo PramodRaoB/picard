@@ -53,6 +53,7 @@ public class ReadEndsForMarkDuplicates extends ReadEnds implements Cloneable {
     public long read2IndexInFile = -1;
     public int duplicateSetSize = -1;
     public byte firstOfFlag = 0;
+    public int windowIndex = 0; // Book-keeping required for multi-threading
 
     public ReadEndsForMarkDuplicates() {}
 
@@ -76,6 +77,7 @@ public class ReadEndsForMarkDuplicates extends ReadEnds implements Cloneable {
 
         this.read1IndexInFile = read.read1IndexInFile;
         this.read2IndexInFile = read.read2IndexInFile;
+        this.windowIndex = read.windowIndex;
     }
 
     @Override

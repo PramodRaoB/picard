@@ -167,8 +167,8 @@ public class MarkDuplicatesForFlowHelper implements MarkDuplicatesHelper {
      * Builds a read ends object that represents a single read - for flow based read
      */
     @Override
-    public ReadEndsForMarkDuplicates buildReadEnds(final SAMFileHeader header, final long index, final SAMRecord rec, final boolean useBarcodes) {
-        final ReadEndsForMarkDuplicates ends = md.buildReadEnds(header, index, rec, useBarcodes);
+    public ReadEndsForMarkDuplicates buildReadEnds(final SAMFileHeader header, final long index, final SAMRecord rec, final boolean useBarcodes, final int windowIndex) {
+        final ReadEndsForMarkDuplicates ends = md.buildReadEnds(header, index, rec, useBarcodes, windowIndex);
 
         // this code only supported unpaired reads
         if (rec.getReadPairedFlag() && !rec.getMateUnmappedFlag()) {

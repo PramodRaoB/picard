@@ -1034,8 +1034,6 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
         if (useMultithreading) {
             long startingIndex = 0;
             long processedSequentially = 0;
-            long cnt = 0;
-            for (int idx = 0; idx < windows.size(); idx++) cnt += extraList.get(idx).size();
             for (int idx = 0; idx < windows.size(); idx++) {
                 // Set the correct starting index for later steps
                 windows.get(idx).setStartingIndex(startingIndex);
@@ -1046,6 +1044,7 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
                     ReadEndsForMarkDuplicates fragmentEnd = entry.getValue();
                     // Correct the index of this readEnd
                     fragmentEnd.read1IndexInFile = fragmentEnd.read1IndexInFile + startingIndex;
+                    fragmentEnd.windowIndex = -1;
                     ReadEndsForMarkDuplicates pairedEnds = tmp.remove(fragmentEnd.read1ReferenceIndex, key);
                     // See if we've already seen the first end or not
                     if (pairedEnds == null) {
@@ -1111,19 +1110,22 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
         this.threadLocalPairSort.add(pairSort);
         if (useMultithreading) log.info(tmp.size() + " pairs never matched.");
         OperationTimer.stop("Sequential processing (inside BuildReadEnd)");
+        OperationTimer.start("Building read end post-processing");
         log.info("Merging built read end lists");
-        for (SortingCollection<ReadEndsForMarkDuplicates> col : this.threadLocalPairSort) if (col != null) col.doneAdding();
-        for (SortingCollection<ReadEndsForMarkDuplicates> col : this.threadLocalFragSort) if (col != null) col.doneAdding();
+        this.threadLocalPairSort.parallelStream().forEach((item) -> {if (item != null) item.doneAdding();});
+        this.threadLocalFragSort.parallelStream().forEach((item) -> {if (item != null) item.doneAdding();});
         for (Set<String> st : this.threadLocalPGIds) if (st != null) mergeCollection(this.pgIdsSeen, st);
         this.fragSort = new MergingIteratorForSortingCollections<>(threadLocalFragSort, new ReadEndsMDComparator(useBarcodes));
         this.pairSort = new MergingIteratorForSortingCollections<>(threadLocalPairSort, new ReadEndsMDComparator(useBarcodes));
 
         executor.shutdown();
+        OperationTimer.stop("Building read end post-processing");
     }
 
     private ReadEndsForMarkDuplicatesMap processWindowForReadEnds(@Nullable GenomicWindow window, boolean useBarcodes) {
         long startTime = System.nanoTime();
         final int sizeInBytes;
+        final int windowIndex = window != null ? window.windowIndex : 0;
         if (useBarcodes) {
             sizeInBytes = ReadEndsForMarkDuplicatesWithBarcodes.getSizeOf();
         } else {
@@ -1218,7 +1220,7 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
 
             } else if (!rec.isSecondaryOrSupplementary()) {
                 final long indexForRead = assumedSortOrder == SAMFileHeader.SortOrder.queryname ? duplicateIndex : index;
-                final ReadEndsForMarkDuplicates fragmentEnd = calcHelper.buildReadEnds(header, indexForRead, rec, useBarcodes);
+                final ReadEndsForMarkDuplicates fragmentEnd = calcHelper.buildReadEnds(header, indexForRead, rec, useBarcodes, windowIndex);
                 fragSort.add(fragmentEnd);
 
                 if (rec.getReadPairedFlag() && !rec.getMateUnmappedFlag()) {
@@ -1331,7 +1333,7 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
     /**
      * Builds a read ends object that represents a single read.
      */
-    public ReadEndsForMarkDuplicates buildReadEnds(final SAMFileHeader header, final long index, final SAMRecord rec, final boolean useBarcodes) {
+    public ReadEndsForMarkDuplicates buildReadEnds(final SAMFileHeader header, final long index, final SAMRecord rec, final boolean useBarcodes, final int windowIndex) {
         final ReadEndsForMarkDuplicates ends;
 
         if (useBarcodes) {
@@ -1344,6 +1346,7 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
         ends.orientation = rec.getReadNegativeStrandFlag() ? ReadEnds.R : ReadEnds.F;
         ends.read1IndexInFile = index;
         ends.score = DuplicateScoringStrategy.computeDuplicateScore(rec, this.DUPLICATE_SCORING_STRATEGY);
+        ends.windowIndex = windowIndex;
 
         if (rec.getFirstOfPairFlag()) ends.firstOfFlag = 1;
 
@@ -1438,6 +1441,7 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
         log.info("Traversing read pair information and detecting duplicates.");
         while (this.pairSort.hasNext()) {
             final ReadEndsForMarkDuplicates next = this.pairSort.next();
+            updateIndexInFile(next);
             if (firstOfNextChunk != null && areComparableForDuplicates(firstOfNextChunk, next, true, useBarcodes)) {
                 nextChunk.add(next);
             } else {
@@ -1461,6 +1465,7 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
 
         while (this.fragSort.hasNext()) {
             final ReadEndsForMarkDuplicates next = this.fragSort.next();
+            updateIndexInFile(next);
             if (firstOfNextChunk != null && areComparableForDuplicates(firstOfNextChunk, next, false, useBarcodes)) {
                 nextChunk.add(next);
                 containsPairs = containsPairs || next.isPaired();
@@ -1488,6 +1493,15 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
         }
         if (TAG_DUPLICATE_SET_MEMBERS) {
             this.representativeReadIndicesForDuplicates.doneAdding();
+        }
+    }
+
+    private void updateIndexInFile(ReadEndsForMarkDuplicates end) {
+        if (end.windowIndex == -1) return;
+        final GenomicWindow window = windows.get(end.windowIndex);
+        if (end.read1IndexInFile < window.startingIndex) {
+            end.read1IndexInFile += window.startingIndex;
+            end.read2IndexInFile += window.startingIndex;
         }
     }
 

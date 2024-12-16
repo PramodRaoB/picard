@@ -31,6 +31,6 @@ import picard.sam.markduplicates.util.ReadEndsForMarkDuplicates;
 public interface MarkDuplicatesHelper {
 
     void generateDuplicateIndexes(final boolean useBarcodes, final boolean indexOpticalDuplicates);
-    ReadEndsForMarkDuplicates buildReadEnds(final SAMFileHeader header, final long index, final SAMRecord rec, final boolean useBarcodes);
+    ReadEndsForMarkDuplicates buildReadEnds(final SAMFileHeader header, final long index, final SAMRecord rec, final boolean useBarcodes, final int windowIndex);
     short getReadDuplicateScore(final SAMRecord rec, final ReadEndsForMarkDuplicates pairedEnds);
 }
