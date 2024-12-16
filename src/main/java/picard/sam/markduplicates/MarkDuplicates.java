@@ -38,10 +38,7 @@ import picard.sam.markduplicates.util.*;
 import picard.sam.util.RepresentativeReadIndexer;
 
 import javax.annotation.Nullable;
-import java.io.BufferedReader;
-import java.io.File;
-import java.io.FileReader;
-import java.io.IOException;
+import java.io.*;
 import java.util.*;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -417,7 +414,6 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
             for (Future<WindowResult> future : futures) {
                 WindowResult result = future.get();
                 final int originalIndex = useMultithreading ? windows.get(idx).windowIndex : 0;
-                log.info("Setting index " + originalIndex);
                 tempFiles.set(originalIndex, result.tempFile);
 
                 for (Map.Entry<String, DuplicationMetrics> entry :
@@ -434,7 +430,9 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
             }
 
             log.info("Concatenating " + tempFiles.size() + " temp files...");
+            OperationTimer.start("File concatenation (inside Main read/write)");
             concatenateFiles(tempFiles);
+            OperationTimer.stop("File concatenation (inside Main read/write)");
         } catch (Exception e) {
             log.error("Exception occurred", e);
         }
@@ -457,7 +455,6 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
     private WindowResult processWindow(@Nullable GenomicWindow window, int windowIndex) throws IOException {
         long startTime = System.nanoTime();
         File tempFile = File.createTempFile("window_" + windowIndex + "_", ".bam");
-        log.info(String.format("Processing starting for window index %d", windowIndex));
         final SamHeaderAndIterator headerAndIterator = openInputs(false);
         final SAMFileHeader header = headerAndIterator.header;
         final SAMFileHeader.SortOrder sortOrder = header.getSortOrder();
@@ -480,6 +477,7 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
             }
 
             long recordInFileIndex = 0;
+            long skippedRecords = 0;
             long nextOpticalDuplicateIndex = opticalDuplicateIndexes != null && opticalDuplicateIndexes.hasNext() ? opticalDuplicateIndexes.next() : NO_SUCH_INDEX;
             long nextDuplicateIndex = (duplicateIndexes.hasNext() ? duplicateIndexes.next() : NO_SUCH_INDEX);
 
@@ -515,7 +513,10 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
 
             while (iterator.hasNext()) {
                 final SAMRecord rec = iterator.next();
-                if (window != null && rec.getAlignmentStart() < window.start) continue;
+                if (window != null && rec.getAlignmentStart() < window.start) {
+                    skippedRecords++;
+                    continue;
+                }
 
                 DuplicationMetrics metrics = AbstractMarkDuplicatesCommandLineProgram.addReadToLibraryMetrics(rec, header, localMetrics, flowBasedArguments.FLOW_MODE);
 
@@ -613,13 +614,13 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
             if (TAG_DUPLICATE_SET_MEMBERS) {
                 representativeReadIndicesForDuplicates.cleanup();
             }
+            log.info(String.format("For writing window %d (%d records, %d skipped) - took %d seconds", windowIndex, recordInFileIndex - (useMultithreading ? window.startingIndex : 0), skippedRecords, (System.nanoTime() - startTime) / 1_000_000_000));
         }
-        log.info("For writing window " + windowIndex + " took " + (System.nanoTime() - startTime) / 1_000_000_000 + " seconds.");
 
         return new WindowResult(tempFile, localMetrics);
     }
 
-    private void concatenateFiles(List<File> tempFiles) throws IOException {
+    private void concatenateFiles(List<File> tempFiles) {
         BamFileIoUtils.gatherWithBlockCopying(tempFiles, OUTPUT, false, false);
 
         // Clean up temp files
@@ -683,7 +684,10 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
                         cov = new CoverageAwareWindowCalculator();
                         cov.parseCoverageInformation(COVERAGE_BEDGRAPH);
                         OperationTimer.stop("Parsing bedgraph");
-                    } catch (IOException ignored) {}
+                    } catch (IOException e) {
+                        log.info("Exception while parsing: ", e);
+                        log.info("Proceeding with heuristic splitting of windows");
+                    }
                 }
                 for (int i = 0; i < header.getSequenceDictionary().size(); i++) {
                     SAMSequenceRecord seq = header.getSequence(i);
@@ -755,27 +759,79 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
 
         Map<String, List<CoverageRegion>> coverageByChrom;
 
+        private Map<String, List<CoverageRegion>> processBedGraphPartition(File file, long startPos, long endPos) throws IOException {
+            Map<String, List<CoverageRegion>> coverageByChrom = new HashMap<>();
+            try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
+                long currentPos = 0;
+                while (currentPos < startPos) {
+                    int skip = (int) Math.min(startPos - currentPos, Integer.MAX_VALUE);
+                    currentPos += reader.skip(skip);
+                }
+
+                // If we're not at the start of the file, find the next line boundary
+                if (startPos > 0) {
+                    String partialLine = reader.readLine();
+                    if (partialLine != null) {
+                        currentPos += partialLine.length() + System.lineSeparator().length();
+                    }
+                }
+
+                String line;
+
+                while (currentPos <= endPos && (line = reader.readLine()) != null) {
+                    currentPos += line.length() + System.lineSeparator().length();
+
+                    if (line.startsWith("track")) continue;
+
+                    String[] parts = line.trim().split("\\s+");
+                    String chrom = parts[0];
+                    int start = Integer.parseInt(parts[1]);
+                    int end = Integer.parseInt(parts[2]);
+                    double coverage = Double.parseDouble(parts[3]);
+
+                    if (coverage > 0) {
+                        coverageByChrom
+                                .computeIfAbsent(chrom, k -> new ArrayList<>())
+                                .add(new CoverageRegion(start, end, coverage));
+                    }
+                }
+            }
+            log.info("Done parsed");
+            return coverageByChrom;
+        }
+
         public void parseCoverageInformation(String bedGraphFile) throws IOException {
             this.coverageByChrom = new HashMap<>();
 
-            // Parse bedGraph file
-            BufferedReader reader = new BufferedReader(new FileReader(bedGraphFile));
-            String line;
-            while ((line = reader.readLine()) != null) {
-                if (line.startsWith("track")) continue;
+            File file = new File(bedGraphFile);
+            long fileSize = file.length();
+            long chunkSize = fileSize / NUM_THREADS;
 
-                String[] parts = line.trim().split("\\s+");
-                String chrom = parts[0];
-                int start = Integer.parseInt(parts[1]);
-                int end = Integer.parseInt(parts[2]);
-                double coverage = Double.parseDouble(parts[3]);
+            // Create thread pool
+            ExecutorService executor = Executors.newFixedThreadPool(NUM_THREADS);
+            List<Future<?>> futures = new ArrayList<>();
 
-                if (coverage > 0) {
-                    coverageByChrom
-                            .computeIfAbsent(chrom, k -> new ArrayList<>())
-                            .add(new CoverageRegion(start, end, coverage));
-                }
+            // Submit tasks for each chunk
+            for (int i = 0; i < NUM_THREADS; i++) {
+                long startPos = i * chunkSize;
+                long endPos = (i == NUM_THREADS - 1) ? fileSize : (i + 1) * chunkSize;
+
+                futures.add(executor.submit(() -> processBedGraphPartition(file, startPos, endPos)));
             }
+
+            try {
+                for (Future<?> future : futures) {
+                    Map<String, List<CoverageRegion>> mp = (Map<String, List<CoverageRegion>>) future.get();
+                    for (Map.Entry<String, List<CoverageRegion>> entry: mp.entrySet()) {
+                        String key = entry.getKey();
+                        coverageByChrom.computeIfAbsent(key, k -> new ArrayList<>()).addAll(entry.getValue());
+                    }
+                }
+                executor.shutdown();
+            } catch (Exception e) {
+                log.info("Failed to parse bedgraph: ", e);
+            }
+
         }
 
         public List<GenomicWindow> calculateWindows(GenomicWindow window, int windowIndex) {
@@ -974,12 +1030,12 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
         } catch (Exception e) {
             throw new PicardException("Error processing windows", e);
         }
+        OperationTimer.start("Sequential processing (inside BuildReadEnd)");
         if (useMultithreading) {
             long startingIndex = 0;
             long processedSequentially = 0;
             long cnt = 0;
             for (int idx = 0; idx < windows.size(); idx++) cnt += extraList.get(idx).size();
-            log.info("Going to process " + cnt + " records sequentially");
             for (int idx = 0; idx < windows.size(); idx++) {
                 // Set the correct starting index for later steps
                 windows.get(idx).setStartingIndex(startingIndex);
@@ -1054,6 +1110,7 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
         }
         this.threadLocalPairSort.add(pairSort);
         if (useMultithreading) log.info(tmp.size() + " pairs never matched.");
+        OperationTimer.stop("Sequential processing (inside BuildReadEnd)");
         log.info("Merging built read end lists");
         for (SortingCollection<ReadEndsForMarkDuplicates> col : this.threadLocalPairSort) if (col != null) col.doneAdding();
         for (SortingCollection<ReadEndsForMarkDuplicates> col : this.threadLocalFragSort) if (col != null) col.doneAdding();
