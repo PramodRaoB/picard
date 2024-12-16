@@ -12,7 +12,7 @@ import java.util.*;
  * using a priority queue.
  */
 public class MergingIteratorForSortingCollections<T> implements CloseableIterator<T> {
-    private final PriorityQueue<PeekSortingCollectionIterator> queue;
+    private final TreeSet<PeekSortingCollectionIterator> queue;
     List<SortingCollection<T>> collections;
     private final Comparator<T> comparator;
     private boolean isClosed = false;
@@ -25,7 +25,7 @@ public class MergingIteratorForSortingCollections<T> implements CloseableIterato
      */
     public MergingIteratorForSortingCollections(List<SortingCollection<T>> collections, Comparator<T> comparator) {
         this.comparator = comparator;
-        this.queue = new PriorityQueue<>(new PeekSortingCollectionIteratorComparator());
+        this.queue = new TreeSet<>(new PeekSortingCollectionIteratorComparator());
         this.collections = collections;
         if (collections.isEmpty()) {
             isClosed = true;
@@ -60,7 +60,7 @@ public class MergingIteratorForSortingCollections<T> implements CloseableIterato
         }
 
         // Get the iterator with the smallest next element
-        final PeekSortingCollectionIterator iterator = queue.poll();
+        final PeekSortingCollectionIterator iterator = queue.pollFirst();
         final T result = iterator.next();
 
         // If this iterator has more elements, add it back to the queue
@@ -82,7 +82,7 @@ public class MergingIteratorForSortingCollections<T> implements CloseableIterato
     public void close() {
         if (!isClosed) {
             while (!queue.isEmpty()) {
-                PeekSortingCollectionIterator iterator = queue.poll();
+                PeekSortingCollectionIterator iterator = queue.pollFirst();
                 ((CloseableIterator<T>) iterator.getUnderlyingIterator()).close();
             }
             for (SortingCollection<T> collection: this.collections) if (collection != null) collection.cleanup();
