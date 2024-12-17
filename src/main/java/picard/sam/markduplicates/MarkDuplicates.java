@@ -229,8 +229,10 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
 
     protected MergingIteratorForSortingCollections<ReadEndsForMarkDuplicates> pairSort;
     protected MergingIteratorForSortingCollections<ReadEndsForMarkDuplicates> fragSort;
-    protected GenomicPartitionedCollection<SortingLongCollection> duplicateIndexes;
-    protected GenomicPartitionedCollection<SortingLongCollection> opticalDuplicateIndexes;
+    protected GenomicPartitionedCollection<SortingLongCollectionForMarkDuplicates> duplicateIndexesPairs;
+    protected GenomicPartitionedCollection<SortingLongCollectionForMarkDuplicates> duplicateIndexesFragments;
+    protected GenomicPartitionedCollection<SortingLongCollectionForMarkDuplicates> opticalDuplicateIndexesPartitioned;
+    protected List<MergingIteratorForTwoSortingLongCollections> duplicateIndexes;
     protected GenomicPartitionedCollection<SortingCollection<RepresentativeReadIndexer>> representativeReadIndicesForDuplicates;
     protected List<GenomicWindow> windows;
     private List<SortingCollection<ReadEndsForMarkDuplicates>> threadLocalPairSort;
@@ -471,9 +473,9 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
 
         try (SAMFileWriter out = new SAMFileWriterFactory().makeWriter(outputHeader, true, tempFile, REFERENCE_SEQUENCE)) {
             // Now copy over the file while marking all the necessary indexes as duplicates
-            SortingLongCollection duplicateIndexes = this.duplicateIndexes.getPartition(windowIndex);
+            MergingIteratorForTwoSortingLongCollections duplicateIndexes = this.duplicateIndexes.get(windowIndex);
 
-            SortingLongCollection opticalDuplicateIndexes = this.opticalDuplicateIndexes != null ? this.opticalDuplicateIndexes.getPartition(windowIndex) : null;
+            SortingLongCollectionForMarkDuplicates opticalDuplicateIndexes = this.opticalDuplicateIndexesPartitioned != null ? this.opticalDuplicateIndexesPartitioned.getPartition(windowIndex) : null;
 
             SortingCollection<RepresentativeReadIndexer> representativeReadIndicesForDuplicates = null;
             if (TAG_DUPLICATE_SET_MEMBERS && this.representativeReadIndicesForDuplicates != null) {
@@ -1405,21 +1407,22 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
             // three int entries + overhead: (3 * 4) + 4 = 16 bytes
             entryOverhead = 16;
         } else {
-            entryOverhead = SortingLongCollection.SIZEOF;
+            entryOverhead = SortingLongCollectionForMarkDuplicates.SIZEOF;
         }
         // Keep this number from getting too large even if there is a huge heap.
         int maxInMemory = (int) Math.min((Runtime.getRuntime().maxMemory() * 0.25) / entryOverhead, (double) (Integer.MAX_VALUE - 5));
         if (useMultithreading) maxInMemory /= windows.size();
         // If we're also tracking optical duplicates, reduce maxInMemory, since we'll need two sorting collections
         if (indexOpticalDuplicates) {
-            maxInMemory /= ((entryOverhead + SortingLongCollection.SIZEOF) / entryOverhead);
+            maxInMemory /= ((entryOverhead + SortingLongCollectionForMarkDuplicates.SIZEOF) / entryOverhead);
             int finalMaxInMemory = maxInMemory;
-            this.opticalDuplicateIndexes = new GenomicPartitionedCollection<>(windows, () -> new SortingLongCollection(finalMaxInMemory, TMP_DIR.toArray(new File[0])));
+            this.opticalDuplicateIndexesPartitioned = new GenomicPartitionedCollection<>(windows, () -> new SortingLongCollectionForMarkDuplicates(finalMaxInMemory, TMP_DIR.toArray(new File[0])));
         }
 
         log.info("Will retain up to " + maxInMemory + " duplicate indices before spilling to disk.");
         int finalMaxInMemory = maxInMemory;
-        this.duplicateIndexes = new GenomicPartitionedCollection<>(windows, () -> new SortingLongCollection(finalMaxInMemory, TMP_DIR.toArray(new File[0])));
+        this.duplicateIndexesPairs = new GenomicPartitionedCollection<>(windows, () -> new SortingLongCollectionForMarkDuplicates(finalMaxInMemory, TMP_DIR.toArray(new File[0])));
+        this.duplicateIndexesFragments = new GenomicPartitionedCollection<>(windows, () -> new SortingLongCollectionForMarkDuplicates(finalMaxInMemory, TMP_DIR.toArray(new File[0])));
         if (TAG_DUPLICATE_SET_MEMBERS) {
             final RepresentativeReadIndexerCodec representativeIndexCodec = new RepresentativeReadIndexerCodec();
             this.representativeReadIndicesForDuplicates =
@@ -1437,65 +1440,83 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
     public void generateDuplicateIndexes(final boolean useBarcodes, final boolean indexOpticalDuplicates) {
         sortIndicesForDuplicates(indexOpticalDuplicates);
 
-        ReadEndsForMarkDuplicates firstOfNextChunk = null;
-        final List<ReadEndsForMarkDuplicates> nextChunk = new ArrayList<>(200);
+        ExecutorService executor = Executors.newFixedThreadPool(Math.min(NUM_THREADS, 2));
+        List<Future<?>> futures = new ArrayList<>();
 
-        // First just do the pairs
-        log.info("Traversing read pair information and detecting duplicates.");
-        while (this.pairSort.hasNext()) {
-            final ReadEndsForMarkDuplicates next = this.pairSort.next();
-            updateIndexInFile(next);
-            if (firstOfNextChunk != null && areComparableForDuplicates(firstOfNextChunk, next, true, useBarcodes)) {
-                nextChunk.add(next);
-            } else {
-                handleChunk(nextChunk);
-                nextChunk.clear();
-                nextChunk.add(next);
-                firstOfNextChunk = next;
-            }
-        }
-        handleChunk(nextChunk);
+        futures.add(executor.submit(() -> {
+            ReadEndsForMarkDuplicates firstOfNextChunk = null;
+            final List<ReadEndsForMarkDuplicates> nextChunk = new ArrayList<>(200);
 
-        this.pairSort.close();
-        this.pairSort = null;
-
-        // Now deal with the fragments
-        log.info("Traversing fragment information and detecting duplicates.");
-        boolean containsPairs = false;
-        boolean containsFrags = false;
-
-        firstOfNextChunk = null;
-
-        while (this.fragSort.hasNext()) {
-            final ReadEndsForMarkDuplicates next = this.fragSort.next();
-            updateIndexInFile(next);
-            if (firstOfNextChunk != null && areComparableForDuplicates(firstOfNextChunk, next, false, useBarcodes)) {
-                nextChunk.add(next);
-                containsPairs = containsPairs || next.isPaired();
-                containsFrags = containsFrags || !next.isPaired();
-            } else {
-                if (nextChunk.size() > 1 && containsFrags) {
-                    markDuplicateFragments(nextChunk, containsPairs);
+            // First just do the pairs
+            log.info("Traversing read pair information and detecting duplicates.");
+            while (this.pairSort.hasNext()) {
+                final ReadEndsForMarkDuplicates next = this.pairSort.next();
+                updateIndexInFile(next);
+                if (firstOfNextChunk != null && areComparableForDuplicates(firstOfNextChunk, next, true, useBarcodes)) {
+                    nextChunk.add(next);
+                } else {
+                    handleChunk(nextChunk);
+                    nextChunk.clear();
+                    nextChunk.add(next);
+                    firstOfNextChunk = next;
                 }
-                nextChunk.clear();
-                nextChunk.add(next);
-                firstOfNextChunk = next;
-                containsPairs = next.isPaired();
-                containsFrags = !next.isPaired();
             }
-        }
-        markDuplicateFragments(nextChunk, containsPairs);
+            handleChunk(nextChunk);
 
-        this.fragSort.close();
-        this.fragSort = null;
+            this.pairSort.close();
+            this.pairSort = null;
+
+            this.duplicateIndexesPairs.doneAdding();
+            if (this.opticalDuplicateIndexesPartitioned != null) {
+                this.opticalDuplicateIndexesPartitioned.doneAdding();
+            }
+
+            if (TAG_DUPLICATE_SET_MEMBERS) {
+                this.representativeReadIndicesForDuplicates.doneAdding();
+            }
+        }));
+
+        futures.add(executor.submit(() -> {
+            ReadEndsForMarkDuplicates firstOfNextChunk = null;
+            final List<ReadEndsForMarkDuplicates> nextChunk = new ArrayList<>(200);
+            // Now deal with the fragments
+            log.info("Traversing fragment information and detecting duplicates.");
+            boolean containsPairs = false;
+            boolean containsFrags = false;
+
+            while (this.fragSort.hasNext()) {
+                final ReadEndsForMarkDuplicates next = this.fragSort.next();
+                updateIndexInFile(next);
+                if (firstOfNextChunk != null && areComparableForDuplicates(firstOfNextChunk, next, false, useBarcodes)) {
+                    nextChunk.add(next);
+                    containsPairs = containsPairs || next.isPaired();
+                    containsFrags = containsFrags || !next.isPaired();
+                } else {
+                    if (nextChunk.size() > 1 && containsFrags) {
+                        markDuplicateFragments(nextChunk, containsPairs);
+                    }
+                    nextChunk.clear();
+                    nextChunk.add(next);
+                    firstOfNextChunk = next;
+                    containsPairs = next.isPaired();
+                    containsFrags = !next.isPaired();
+                }
+            }
+            markDuplicateFragments(nextChunk, containsPairs);
+
+            this.fragSort.close();
+            this.fragSort = null;
+
+            this.duplicateIndexesFragments.doneAdding();
+        }));
 
         log.info("Sorting list of duplicate records.");
-        this.duplicateIndexes.doneAdding();
-        if (this.opticalDuplicateIndexes != null) {
-            this.opticalDuplicateIndexes.doneAdding();
-        }
-        if (TAG_DUPLICATE_SET_MEMBERS) {
-            this.representativeReadIndicesForDuplicates.doneAdding();
+
+        this.duplicateIndexes = new ArrayList<>(windows.size());
+        if (useMultithreading) {
+            for (int idx = 0; idx < windows.size(); idx++) {
+                this.duplicateIndexes.set(idx, new MergingIteratorForTwoSortingLongCollections(this.duplicateIndexesPairs.getPartition(idx), this.duplicateIndexesFragments.getPartition(idx)));
+            }
         }
     }
 
@@ -1544,8 +1565,8 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
         return areComparable;
     }
 
-    private void addIndexAsDuplicate(final long bamIndex) {
-        this.duplicateIndexes.add(bamIndex);
+    private void addIndexAsDuplicate(GenomicPartitionedCollection duplicateIndexesPartitioned, final long bamIndex) {
+        duplicateIndexesPartitioned.add(bamIndex);
         ++this.numDuplicateIndices;
     }
 
@@ -1606,22 +1627,22 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
 
         for (final ReadEndsForMarkDuplicates end : list) {
             if (end != best) {
-                addIndexAsDuplicate(end.read1IndexInFile);
+                addIndexAsDuplicate(this.duplicateIndexesPairs, end.read1IndexInFile);
 
                 // in query-sorted case, these will be the same.
                 // TODO: also in coordinate sorted, when one read is unmapped
                 if (end.read2IndexInFile != end.read1IndexInFile) {
-                    addIndexAsDuplicate(end.read2IndexInFile);
+                    addIndexAsDuplicate(this.duplicateIndexesPairs, end.read2IndexInFile);
                 }
 
-                if (end.isOpticalDuplicate && this.opticalDuplicateIndexes != null) {
-                    this.opticalDuplicateIndexes.add(end.read1IndexInFile);
+                if (end.isOpticalDuplicate && this.opticalDuplicateIndexesPartitioned != null) {
+                    this.opticalDuplicateIndexesPartitioned.add(end.read1IndexInFile);
                     // We expect end.read2IndexInFile==read1IndexInFile when we are in queryname sorted files, as the read-pairs
                     // will be sorted together and nextIndexIfNeeded() will only pull one index from opticalDuplicateIndexes.
                     // This means that in queryname sorted order we will only pull from the sorting collection once,
                     // where as we would pull twice for coordinate sorted files.
                     if (end.read2IndexInFile != end.read1IndexInFile) {
-                        this.opticalDuplicateIndexes.add(end.read2IndexInFile);
+                        this.opticalDuplicateIndexesPartitioned.add(end.read2IndexInFile);
                     }
                 }
             }
@@ -1629,7 +1650,7 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
     }
 
     /**
-     * Method for deciding when to pull from the SortingLongCollection for the next read based on sorting order.
+     * Method for deciding when to pull from the SortingLongCollectionForMarkDuplicates for the next read based on sorting order.
      * - If file is queryname sorted then we expect one index per pair of reads, so we only want to iterate when we
      * are no longer reading from that read-pair.
      * - If file is coordinate-sorted we want to base our iteration entirely on the indexes of both reads in the pair
@@ -1644,7 +1665,20 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
      * @param duplicateIndexes   DuplicateIndexes collection to iterate over
      * @return the duplicate after iteration
      */
-    private long nextIndexIfNeeded(final SAMFileHeader.SortOrder sortOrder, final long recordInFileIndex, final long nextDuplicateIndex, final String lastQueryName, final SAMRecord rec, final SortingLongCollection duplicateIndexes) {
+    private long nextIndexIfNeeded(final SAMFileHeader.SortOrder sortOrder, final long recordInFileIndex, final long nextDuplicateIndex, final String lastQueryName, final SAMRecord rec, final SortingLongCollectionForMarkDuplicates duplicateIndexes) {
+        // Manage the flagging of optical/sequencing duplicates
+        // Possibly figure out the next opticalDuplicate index (if going by coordinate, if going by query name, only do this
+        // if the query name has changed)
+        final boolean needNextDuplicateIndex = recordInFileIndex > nextDuplicateIndex &&
+                (sortOrder == SAMFileHeader.SortOrder.coordinate || !rec.getReadName().equals(lastQueryName));
+
+        if (needNextDuplicateIndex) {
+            return (duplicateIndexes.hasNext() ? duplicateIndexes.next() : NO_SUCH_INDEX);
+        }
+        return nextDuplicateIndex;
+    }
+
+    private long nextIndexIfNeeded(final SAMFileHeader.SortOrder sortOrder, final long recordInFileIndex, final long nextDuplicateIndex, final String lastQueryName, final SAMRecord rec, final MergingIteratorForTwoSortingLongCollections duplicateIndexes) {
         // Manage the flagging of optical/sequencing duplicates
         // Possibly figure out the next opticalDuplicate index (if going by coordinate, if going by query name, only do this
         // if the query name has changed)
@@ -1667,7 +1701,7 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
         if (containsPairs) {
             for (final ReadEndsForMarkDuplicates end : list) {
                 if (!end.isPaired()) {
-                    addIndexAsDuplicate(end.read1IndexInFile);
+                    addIndexAsDuplicate(this.duplicateIndexesFragments, end.read1IndexInFile);
                 }
             }
         } else {
@@ -1682,7 +1716,7 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
 
             for (final ReadEndsForMarkDuplicates end : list) {
                 if (end != best) {
-                    addIndexAsDuplicate(end.read1IndexInFile);
+                    addIndexAsDuplicate(this.duplicateIndexesFragments, end.read1IndexInFile);
                 }
             }
         }
@@ -1756,8 +1790,8 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
             T collection = collections.get(partition);
 
             // Handle different collection types
-            if (collection instanceof SortingLongCollection) {
-                ((SortingLongCollection) collection).add((Long) value);
+            if (collection instanceof SortingLongCollectionForMarkDuplicates) {
+                ((SortingLongCollectionForMarkDuplicates) collection).add((Long) value);
             } else if (collection instanceof SortingCollection) {
                 ((SortingCollection) collection).add(value);
             }
@@ -1769,8 +1803,8 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
 
         public void doneAdding() {
             for (T collection : collections) {
-                if (collection instanceof SortingLongCollection) {
-                    ((SortingLongCollection) collection).doneAddingStartIteration();
+                if (collection instanceof SortingLongCollectionForMarkDuplicates) {
+                    ((SortingLongCollectionForMarkDuplicates) collection).doneAddingStartIteration();
                 } else if (collection instanceof SortingCollection) {
                     ((SortingCollection) collection).doneAdding();
                 }

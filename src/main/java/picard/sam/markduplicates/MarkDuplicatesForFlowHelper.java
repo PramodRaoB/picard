@@ -154,9 +154,10 @@ public class MarkDuplicatesForFlowHelper implements MarkDuplicatesHelper {
         md.fragSort = null;
 
         log.info("Sorting list of duplicate records.");
-        md.duplicateIndexes.doneAdding();
-        if (md.opticalDuplicateIndexes != null) {
-            md.opticalDuplicateIndexes.doneAdding();
+        md.duplicateIndexesFragments.doneAdding();
+        md.duplicateIndexesPairs.doneAdding();
+        if (md.opticalDuplicateIndexesPartitioned != null) {
+            md.opticalDuplicateIndexesPartitioned.doneAdding();
         }
         if (md.TAG_DUPLICATE_SET_MEMBERS) {
             md.representativeReadIndicesForDuplicates.doneAdding();
