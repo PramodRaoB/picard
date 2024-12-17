@@ -23,7 +23,7 @@ public class MergingIteratorForTwoSortingLongCollections {
         if (this.second.hasNext()) secondDone = false;
         else {
             secondDone = true;
-            first.cleanup();
+            second.cleanup();
         }
     }
 

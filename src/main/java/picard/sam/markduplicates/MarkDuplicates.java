@@ -441,7 +441,9 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
             concatenateFiles(tempFiles);
             OperationTimer.stop("File concatenation (inside Main read/write)");
         } catch (Exception e) {
-            log.error("Exception occurred", e);
+            StringWriter sw = new StringWriter();
+            e.printStackTrace(new PrintWriter(sw));
+            log.error("Exception occurred: " + sw.toString());
         }
 
         executor.shutdown();
