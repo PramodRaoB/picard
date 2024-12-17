@@ -247,7 +247,8 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
     // by default, this instance is the helper
     private MarkDuplicatesHelper calcHelper = this;
 
-    private int numDuplicateIndices = 0;
+    private int numDuplicateIndicesPairs = 0;
+    private int numDuplicateIndicesFragments = 0;
     static private final long NO_SUCH_INDEX = Long.MAX_VALUE; // needs to be large so that >= test fails for query-sorted traversal
 
     protected LibraryIdGenerator libraryIdGenerator = null; // this is initialized in buildSortedReadEndLists
@@ -366,7 +367,7 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
         OperationTimer.stop("Generating duplicate indexes");
 
         reportMemoryStats("After generateDuplicateIndexes");
-        log.info("Marking " + this.numDuplicateIndices + " records as duplicates.");
+        log.info("Marking " + (this.numDuplicateIndicesPairs + this.numDuplicateIndicesFragments) + " records as duplicates.");
 
         if (this.READ_NAME_REGEX == null) {
             log.warn("Skipped optical duplicate cluster discovery; library size estimation may be inaccurate!");
@@ -1510,12 +1511,23 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
             this.duplicateIndexesFragments.doneAdding();
         }));
 
+        try {
+            for (Future<?> future : futures) {
+                future.get();
+            }
+        } catch (Exception e) {
+            log.error("Exception occured while generating duplicate indexes ", e);
+        } finally {
+            executor.shutdown();
+        }
+
+
         log.info("Sorting list of duplicate records.");
 
         this.duplicateIndexes = new ArrayList<>(windows.size());
         if (useMultithreading) {
             for (int idx = 0; idx < windows.size(); idx++) {
-                this.duplicateIndexes.set(idx, new MergingIteratorForTwoSortingLongCollections(this.duplicateIndexesPairs.getPartition(idx), this.duplicateIndexesFragments.getPartition(idx)));
+                this.duplicateIndexes.add(new MergingIteratorForTwoSortingLongCollections(this.duplicateIndexesPairs.getPartition(idx), this.duplicateIndexesFragments.getPartition(idx)));
             }
         }
     }
@@ -1565,9 +1577,14 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
         return areComparable;
     }
 
-    private void addIndexAsDuplicate(GenomicPartitionedCollection duplicateIndexesPartitioned, final long bamIndex) {
-        duplicateIndexesPartitioned.add(bamIndex);
-        ++this.numDuplicateIndices;
+    private void addIndexAsDuplicate(final long bamIndex, boolean isPair) {
+        if (isPair) {
+            this.duplicateIndexesPairs.add(bamIndex);
+            ++this.numDuplicateIndicesPairs;
+        } else {
+            this.duplicateIndexesFragments.add(bamIndex);
+            ++this.numDuplicateIndicesFragments;
+        }
     }
 
     private void addRepresentativeReadOfDuplicateSet(final long representativeReadIndexInFile, final int setSize, final long read1IndexInFile) {
@@ -1627,12 +1644,12 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
 
         for (final ReadEndsForMarkDuplicates end : list) {
             if (end != best) {
-                addIndexAsDuplicate(this.duplicateIndexesPairs, end.read1IndexInFile);
+                addIndexAsDuplicate(end.read1IndexInFile, true);
 
                 // in query-sorted case, these will be the same.
                 // TODO: also in coordinate sorted, when one read is unmapped
                 if (end.read2IndexInFile != end.read1IndexInFile) {
-                    addIndexAsDuplicate(this.duplicateIndexesPairs, end.read2IndexInFile);
+                    addIndexAsDuplicate(end.read2IndexInFile, true);
                 }
 
                 if (end.isOpticalDuplicate && this.opticalDuplicateIndexesPartitioned != null) {
@@ -1701,7 +1718,7 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
         if (containsPairs) {
             for (final ReadEndsForMarkDuplicates end : list) {
                 if (!end.isPaired()) {
-                    addIndexAsDuplicate(this.duplicateIndexesFragments, end.read1IndexInFile);
+                    addIndexAsDuplicate(end.read1IndexInFile, false);
                 }
             }
         } else {
@@ -1716,7 +1733,7 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
 
             for (final ReadEndsForMarkDuplicates end : list) {
                 if (end != best) {
-                    addIndexAsDuplicate(this.duplicateIndexesFragments, end.read1IndexInFile);
+                    addIndexAsDuplicate(end.read1IndexInFile, false);
                 }
             }
         }
