@@ -40,9 +40,11 @@ import picard.sam.util.RepresentativeReadIndexer;
 import javax.annotation.Nullable;
 import java.io.*;
 import java.util.*;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.function.Consumer;
 import java.util.function.Supplier;
 
 /**
@@ -338,7 +340,7 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
         windows = calculateGenomicWindows();
         OperationTimer.stop("Calculating genomic windows");
 
-        useMultithreading = !windows.isEmpty();
+        useMultithreading = !windows.isEmpty() || NUM_THREADS == 1;
         if (!useMultithreading) {
             log.warn("Could not create processing windows. Proceeding with single-threaded exception.");
         } else {
@@ -1017,7 +1019,7 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
             this.libraryIdGenerator = new LibraryIdGenerator(header, flowBasedArguments.FLOW_MODE);
         }
 
-        ExecutorService executor = Executors.newFixedThreadPool(NUM_THREADS);
+        ExecutorService executor = Executors.newFixedThreadPool(Math.max(NUM_THREADS / 2, 1));
         List<Future<ReadEndsForMarkDuplicatesMap>> futures = new ArrayList<>();
 
         for (GenomicWindow window : windows) {
@@ -1130,6 +1132,50 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
         OperationTimer.stop("Building read end post-processing");
     }
 
+    private static class RecordBuffer {
+        private final List<SAMRecord> records = new ArrayList<>();
+        private CountDownLatch processingLatch = new CountDownLatch(1);
+        private boolean isEndOfInput = false;
+
+        public void add(SAMRecord record) {
+            records.add(record);
+        }
+
+        public void clear() {
+            records.clear();
+        }
+
+        public List<SAMRecord> getRecords() {
+            return records;
+        }
+
+        public void markComplete() {
+            processingLatch.countDown();
+        }
+
+        public void waitForProcessing() throws InterruptedException {
+            processingLatch.await();
+        }
+
+        public void reset() {
+            clear();
+            processingLatch = new CountDownLatch(1);
+            isEndOfInput = false;
+        }
+
+        public void setEndOfInput() {
+            this.isEndOfInput = true;
+        }
+
+        public boolean isEndOfInput() {
+            return isEndOfInput;
+        }
+
+        public boolean isEmpty() {
+            return records.isEmpty();
+        }
+    }
+
     private ReadEndsForMarkDuplicatesMap processWindowForReadEnds(@Nullable GenomicWindow window, boolean useBarcodes) {
         long startTime = System.nanoTime();
         final int sizeInBytes;
@@ -1183,7 +1229,7 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
                         ? new SingleMemoryBasedReadEndsForMarkDuplicatesMap()
                         : new DiskBasedReadEndsForMarkDuplicatesMap(MAX_FILE_HANDLES_FOR_READ_ENDS_MAP, diskCodec);
 
-        long index = 0;
+        final long[] index = {0};
         final ProgressLogger progress = new ProgressLogger(log, (int) 1e6, "Read");
         final CloseableIterator<SAMRecord> iterator;
         if (useMultithreading) {
@@ -1195,125 +1241,172 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
         }
         else iterator = headerAndIterator.iterator;
 
-        String duplicateQueryName = null;
-        long duplicateIndex = NO_SUCH_INDEX;
+        final String[] duplicateQueryName = {null};
+        final long[] duplicateIndex = {NO_SUCH_INDEX};
+
+        Consumer<RecordBuffer> processBuffer = (buffer) -> {
+            try {
+                for (SAMRecord rec : buffer.getRecords()) {
+                    if (window != null && rec.getAlignmentStart() < window.start) continue;
+
+                    // This doesn't have anything to do with building sorted ReadEnd lists, but it can be done in the same pass
+                    // over the input
+                    if (PROGRAM_RECORD_ID != null) {
+                        // Gather all PG IDs seen in merged input files in first pass.  These are gathered for two reasons:
+                        // - to know how many different PG records to create to represent this program invocation.
+                        // - to know what PG IDs are already used to avoid collisions when creating new ones.
+                        // Note that if there are one or more records that do not have a PG tag, then a null value
+                        // will be stored in this set.
+                        pgIdsSeen.add(rec.getStringAttribute(SAMTag.PG.name()));
+                    }
+
+                    // If working in query-sorted, need to keep index of first record with any given query-name.
+                    if (assumedSortOrder == SAMFileHeader.SortOrder.queryname && !rec.getReadName().equals(duplicateQueryName[0])) {
+                        duplicateQueryName[0] = rec.getReadName();
+                        duplicateIndex[0] = index[0];
+                    }
+
+                    if (rec.getReadUnmappedFlag()) {
+                        if (rec.getReferenceIndex() == -1 && assumedSortOrder == SAMFileHeader.SortOrder.coordinate) {
+                            // When we hit the unmapped reads with no coordinate, no reason to continue (only in coordinate sort).
+                            break;
+                        }
+                        // If this read is unmapped but sorted with the mapped reads, just skip it.
+
+                    } else if (!rec.isSecondaryOrSupplementary()) {
+                        final long indexForRead = assumedSortOrder == SAMFileHeader.SortOrder.queryname ? duplicateIndex[0] : index[0];
+                        final ReadEndsForMarkDuplicates fragmentEnd = calcHelper.buildReadEnds(header, indexForRead, rec, useBarcodes, windowIndex);
+                        fragSort.add(fragmentEnd);
+
+                        if (rec.getReadPairedFlag() && !rec.getMateUnmappedFlag()) {
+                            final StringBuilder key = new StringBuilder();
+                            key.append(rec.getReadGroup().getReadGroupId());
+                            key.append(rec.getReadName());
+                            ReadEndsForMarkDuplicates pairedEnds = tmp.remove(rec.getReferenceIndex(), key.toString());
+
+                            // See if we've already seen the first end or not
+                            if (pairedEnds == null) {
+                                // at this point pairedEnds and fragmentEnd are the same, but we need to make
+                                // a copy since pairedEnds will be modified when the mate comes along.
+                                pairedEnds = fragmentEnd.clone();
+                                if (useBarcodes) {
+                                    ((ReadEndsForMarkDuplicatesWithBarcodes) pairedEnds).readOneBarcode = getReadOneBarcodeValue(rec);
+                                    ((ReadEndsForMarkDuplicatesWithBarcodes) pairedEnds).readTwoBarcode = getReadTwoBarcodeValue(rec);
+                                }
+                                tmp.put(pairedEnds.read2ReferenceIndex, key.toString(), pairedEnds);
+                            } else {
+                                final int matesRefIndex = fragmentEnd.read1ReferenceIndex;
+                                final int matesCoordinate = fragmentEnd.read1Coordinate;
+
+                                // Set orientationForOpticalDuplicates, which always goes by the first then the second end for the strands.  NB: must do this
+                                // before updating the orientation later.
+                                if (rec.getFirstOfPairFlag()) {
+                                    pairedEnds.orientationForOpticalDuplicates = ReadEnds.getOrientationByte(rec.getReadNegativeStrandFlag(), pairedEnds.orientation == ReadEnds.R);
+                                    if (useBarcodes) {
+                                        ((ReadEndsForMarkDuplicatesWithBarcodes) pairedEnds).readOneBarcode = getReadOneBarcodeValue(rec);
+                                    }
+                                } else {
+                                    pairedEnds.orientationForOpticalDuplicates = ReadEnds.getOrientationByte(pairedEnds.orientation == ReadEnds.R, rec.getReadNegativeStrandFlag());
+                                    if (useBarcodes) {
+                                        ((ReadEndsForMarkDuplicatesWithBarcodes) pairedEnds).readTwoBarcode = getReadTwoBarcodeValue(rec);
+                                    }
+                                }
+
+                                // If the other read is actually later, simply add the other read's data as read2, else flip the reads
+                                if (matesRefIndex > pairedEnds.read1ReferenceIndex ||
+                                        (matesRefIndex == pairedEnds.read1ReferenceIndex && matesCoordinate >= pairedEnds.read1Coordinate)) {
+                                    pairedEnds.read2ReferenceIndex = matesRefIndex;
+                                    pairedEnds.read2Coordinate = matesCoordinate;
+                                    pairedEnds.read2IndexInFile = indexForRead;
+                                    pairedEnds.orientation = ReadEnds.getOrientationByte(pairedEnds.orientation == ReadEnds.R,
+                                            rec.getReadNegativeStrandFlag());
+
+                                    // if the two read ends are in the same position, pointing in opposite directions,
+                                    // the orientation is undefined and the procedure above
+                                    // will depend on the order of the reads in the file.
+                                    // To avoid this, we set it explicitly (to FR):
+                                    if (pairedEnds.read2ReferenceIndex == pairedEnds.read1ReferenceIndex &&
+                                            pairedEnds.read2Coordinate == pairedEnds.read1Coordinate &&
+                                            pairedEnds.orientation == ReadEnds.RF) {
+                                        pairedEnds.orientation = ReadEnds.FR;
+                                    }
+                                } else {
+                                    pairedEnds.read2ReferenceIndex = pairedEnds.read1ReferenceIndex;
+                                    pairedEnds.read2Coordinate = pairedEnds.read1Coordinate;
+                                    pairedEnds.read2IndexInFile = pairedEnds.read1IndexInFile;
+                                    pairedEnds.read1ReferenceIndex = matesRefIndex;
+                                    pairedEnds.read1Coordinate = matesCoordinate;
+                                    pairedEnds.read1IndexInFile = indexForRead;
+                                    pairedEnds.orientation = ReadEnds.getOrientationByte(rec.getReadNegativeStrandFlag(),
+                                            pairedEnds.orientation == ReadEnds.R);
+                                }
+
+                                pairedEnds.score += fragmentEnd.score;
+                                pairSort.add(pairedEnds);
+                            }
+                        }
+                    }
+                    // Print out some stats every 1m reads
+                    ++index[0];
+                    if (progress.record(rec)) {
+                        log.info("Tracking " + tmp.size() + " as yet unmatched pairs. " + tmp.sizeInRam() + " records in RAM.");
+                    }
+                }
+            } finally {
+                buffer.markComplete();
+            }
+        };
+
+        final int BUFFER_SIZE = 1000; // Adjust this based on your needs
+        RecordBuffer[] buffers = new RecordBuffer[]{new RecordBuffer(), new RecordBuffer()};
+        int currentBuffer = 0;
+        boolean isFirstBuffer = true;
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        Future<?> processingFuture = null;
 
         while (iterator.hasNext()) {
             final SAMRecord rec = iterator.next();
-            if (window != null && rec.getAlignmentStart() < window.start) continue;
-
-            // This doesn't have anything to do with building sorted ReadEnd lists, but it can be done in the same pass
-            // over the input
-            if (PROGRAM_RECORD_ID != null) {
-                // Gather all PG IDs seen in merged input files in first pass.  These are gathered for two reasons:
-                // - to know how many different PG records to create to represent this program invocation.
-                // - to know what PG IDs are already used to avoid collisions when creating new ones.
-                // Note that if there are one or more records that do not have a PG tag, then a null value
-                // will be stored in this set.
-                pgIdsSeen.add(rec.getStringAttribute(SAMTag.PG.name()));
-            }
-
-            // If working in query-sorted, need to keep index of first record with any given query-name.
-            if (assumedSortOrder == SAMFileHeader.SortOrder.queryname && !rec.getReadName().equals(duplicateQueryName)) {
-                duplicateQueryName = rec.getReadName();
-                duplicateIndex = index;
-            }
-
-            if (rec.getReadUnmappedFlag()) {
-                if (rec.getReferenceIndex() == -1 && assumedSortOrder == SAMFileHeader.SortOrder.coordinate) {
-                    // When we hit the unmapped reads with no coordinate, no reason to continue (only in coordinate sort).
-                    break;
-                }
-                // If this read is unmapped but sorted with the mapped reads, just skip it.
-
-            } else if (!rec.isSecondaryOrSupplementary()) {
-                final long indexForRead = assumedSortOrder == SAMFileHeader.SortOrder.queryname ? duplicateIndex : index;
-                final ReadEndsForMarkDuplicates fragmentEnd = calcHelper.buildReadEnds(header, indexForRead, rec, useBarcodes, windowIndex);
-                fragSort.add(fragmentEnd);
-
-                if (rec.getReadPairedFlag() && !rec.getMateUnmappedFlag()) {
-                    final StringBuilder key = new StringBuilder();
-                    key.append(rec.getReadGroup().getReadGroupId());
-                    key.append(rec.getReadName());
-                    ReadEndsForMarkDuplicates pairedEnds = tmp.remove(rec.getReferenceIndex(), key.toString());
-
-                    // See if we've already seen the first end or not
-                    if (pairedEnds == null) {
-                        // at this point pairedEnds and fragmentEnd are the same, but we need to make
-                        // a copy since pairedEnds will be modified when the mate comes along.
-                        pairedEnds = fragmentEnd.clone();
-                        if (useBarcodes) {
-                            ((ReadEndsForMarkDuplicatesWithBarcodes) pairedEnds).readOneBarcode = getReadOneBarcodeValue(rec);
-                            ((ReadEndsForMarkDuplicatesWithBarcodes) pairedEnds).readTwoBarcode = getReadTwoBarcodeValue(rec);
-                        }
-                        tmp.put(pairedEnds.read2ReferenceIndex, key.toString(), pairedEnds);
-                    } else {
-                        final int matesRefIndex = fragmentEnd.read1ReferenceIndex;
-                        final int matesCoordinate = fragmentEnd.read1Coordinate;
-
-                        // Set orientationForOpticalDuplicates, which always goes by the first then the second end for the strands.  NB: must do this
-                        // before updating the orientation later.
-                        if (rec.getFirstOfPairFlag()) {
-                            pairedEnds.orientationForOpticalDuplicates = ReadEnds.getOrientationByte(rec.getReadNegativeStrandFlag(), pairedEnds.orientation == ReadEnds.R);
-                            if (useBarcodes) {
-                                ((ReadEndsForMarkDuplicatesWithBarcodes) pairedEnds).readOneBarcode = getReadOneBarcodeValue(rec);
-                            }
-                        } else {
-                            pairedEnds.orientationForOpticalDuplicates = ReadEnds.getOrientationByte(pairedEnds.orientation == ReadEnds.R, rec.getReadNegativeStrandFlag());
-                            if (useBarcodes) {
-                                ((ReadEndsForMarkDuplicatesWithBarcodes) pairedEnds).readTwoBarcode = getReadTwoBarcodeValue(rec);
-                            }
-                        }
-
-                        // If the other read is actually later, simply add the other read's data as read2, else flip the reads
-                        if (matesRefIndex > pairedEnds.read1ReferenceIndex ||
-                                (matesRefIndex == pairedEnds.read1ReferenceIndex && matesCoordinate >= pairedEnds.read1Coordinate)) {
-                            pairedEnds.read2ReferenceIndex = matesRefIndex;
-                            pairedEnds.read2Coordinate = matesCoordinate;
-                            pairedEnds.read2IndexInFile = indexForRead;
-                            pairedEnds.orientation = ReadEnds.getOrientationByte(pairedEnds.orientation == ReadEnds.R,
-                                    rec.getReadNegativeStrandFlag());
-
-                            // if the two read ends are in the same position, pointing in opposite directions,
-                            // the orientation is undefined and the procedure above
-                            // will depend on the order of the reads in the file.
-                            // To avoid this, we set it explicitly (to FR):
-                            if (pairedEnds.read2ReferenceIndex == pairedEnds.read1ReferenceIndex &&
-                                    pairedEnds.read2Coordinate == pairedEnds.read1Coordinate &&
-                                    pairedEnds.orientation == ReadEnds.RF) {
-                                pairedEnds.orientation = ReadEnds.FR;
-                            }
-                        } else {
-                            pairedEnds.read2ReferenceIndex = pairedEnds.read1ReferenceIndex;
-                            pairedEnds.read2Coordinate = pairedEnds.read1Coordinate;
-                            pairedEnds.read2IndexInFile = pairedEnds.read1IndexInFile;
-                            pairedEnds.read1ReferenceIndex = matesRefIndex;
-                            pairedEnds.read1Coordinate = matesCoordinate;
-                            pairedEnds.read1IndexInFile = indexForRead;
-                            pairedEnds.orientation = ReadEnds.getOrientationByte(rec.getReadNegativeStrandFlag(),
-                                    pairedEnds.orientation == ReadEnds.R);
-                        }
-
-                        pairedEnds.score += fragmentEnd.score;
-                        pairSort.add(pairedEnds);
+            buffers[currentBuffer].add(rec);
+            if (buffers[currentBuffer].getRecords().size() >= BUFFER_SIZE) {
+                if (useMultithreading && !isFirstBuffer) {
+                    try {
+                        processingFuture.get();
+                    } catch (Exception e) {
+                        throw new PicardException("Error processing buffer", e);
                     }
                 }
-            }
 
-            // Print out some stats every 1m reads
-            ++index;
-            if (progress.record(rec)) {
-                log.info("Tracking " + tmp.size() + " as yet unmatched pairs. " + tmp.sizeInRam() + " records in RAM.");
+                int finalCurrentBuffer = currentBuffer;
+                if (useMultithreading) processingFuture = executor.submit(() -> processBuffer.accept(buffers[finalCurrentBuffer]));
+                else processBuffer.accept(buffers[finalCurrentBuffer]);
+
+                currentBuffer = 1 - currentBuffer;
+                buffers[currentBuffer].reset();
+                isFirstBuffer = false;
             }
         }
 
-        // Set the correct record count for the current partition
-        if (window != null) window.setRecordCount(index);
+        if (!buffers[currentBuffer].isEmpty()) {
+            if (processingFuture != null) {
+                try {
+                    processingFuture.get();
+                } catch (Exception e) {
+                    throw new PicardException("Error processing buffer", e);
+                }
+            }
+            buffers[currentBuffer].setEndOfInput();
+            processBuffer.accept(buffers[currentBuffer]);
+        }
 
-        log.info("Read " + index + " records. " + tmp.size() + " pairs never matched.");
+        executor.shutdown();
+
+        // Set the correct record count for the current partition
+        if (window != null) window.setRecordCount(index[0]);
+
+        log.info("Read " + index[0] + " records. " + tmp.size() + " pairs never matched.");
         iterator.close();
 
-        log.info("For building " + index + " records - took " + (System.nanoTime() - startTime) / 1_000_000_000 + " seconds.");
+        log.info("For building " + index[0] + " records - took " + (System.nanoTime() - startTime) / 1_000_000_000 + " seconds.");
         return tmp;
     }
 
