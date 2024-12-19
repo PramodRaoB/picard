@@ -30,16 +30,13 @@ import java.io.*;
 
 /** Codec for ReadEnds that just outputs the primitive fields and reads them back. */
 public class ReadEndsForMarkDuplicatesCodec implements SortingCollection.Codec<ReadEndsForMarkDuplicates> {
-    protected DataInputStream in;
-    protected DataOutputStream out;
+    private DataInputStream in;
+    private DataOutputStream out;
+    private static final int BUFFER_SIZE = 128*1024; // 128KB buffer
 
-    public SortingCollection.Codec<ReadEndsForMarkDuplicates> clone() {
+    public ReadEndsForMarkDuplicatesCodec clone() {
         return new ReadEndsForMarkDuplicatesCodec();
     }
-
-    public void setOutputStream(final OutputStream os) { this.out = new DataOutputStream(os); }
-
-    public void setInputStream(final InputStream is) { this.in = new DataInputStream(is); }
 
     public DataInputStream getInputStream() {
         return in;
@@ -47,6 +44,14 @@ public class ReadEndsForMarkDuplicatesCodec implements SortingCollection.Codec<R
 
     public DataOutputStream getOutputStream() {
         return out;
+    }
+
+    public void setOutputStream(final OutputStream os) {
+        this.out = new DataOutputStream(new BufferedOutputStream(os, BUFFER_SIZE));
+    }
+
+    public void setInputStream(final InputStream is) {
+        this.in = new DataInputStream(new BufferedInputStream(is, BUFFER_SIZE));
     }
 
     public void encode(final ReadEndsForMarkDuplicates read) {
@@ -80,7 +85,6 @@ public class ReadEndsForMarkDuplicatesCodec implements SortingCollection.Codec<R
     public ReadEndsForMarkDuplicates decode() {
         final ReadEndsForMarkDuplicates read = new ReadEndsForMarkDuplicates();
         try {
-            // If the first read results in an EOF we've exhausted the stream
             try {
                 read.score = this.in.readShort();
             } catch (final EOFException eof) {
