@@ -44,13 +44,13 @@ public class ReadEndsForMarkDuplicatesWithBarcodesCodec extends ReadEndsForMarkD
         if (!(read instanceof ReadEndsForMarkDuplicatesWithBarcodes)) {
             throw new PicardException("Read was not a ReadEndsForMarkDuplicatesWithBarcodes");
         }
+        super.encode(read);
 
         try {
-            super.encode(read);
             final ReadEndsForMarkDuplicatesWithBarcodes val = (ReadEndsForMarkDuplicatesWithBarcodes)read;
-            getOutputStream().writeInt(val.barcode);
-            getOutputStream().writeInt(val.readOneBarcode);
-            getOutputStream().writeInt(val.readTwoBarcode);
+            out.writeInt(val.barcode);
+            out.writeInt(val.readOneBarcode);
+            out.writeInt(val.readTwoBarcode);
         } catch (final IOException ioe) {
             throw new PicardException("Exception writing ReadEnds to file.", ioe);
         }
@@ -58,13 +58,13 @@ public class ReadEndsForMarkDuplicatesWithBarcodesCodec extends ReadEndsForMarkD
 
     @Override
     public ReadEndsForMarkDuplicates decode() {
+        final ReadEndsForMarkDuplicates parentRead = super.decode();
+        if (null == parentRead) return null; // EOF
+        final ReadEndsForMarkDuplicatesWithBarcodes read = new ReadEndsForMarkDuplicatesWithBarcodes(parentRead);
         try {
-            final ReadEndsForMarkDuplicates parentRead = super.decode();
-            if (null == parentRead) return null; // EOF
-            final ReadEndsForMarkDuplicatesWithBarcodes read = new ReadEndsForMarkDuplicatesWithBarcodes(parentRead);
-            read.barcode = getInputStream().readInt();
-            read.readOneBarcode = getInputStream().readInt();
-            read.readTwoBarcode = getInputStream().readInt();
+            read.barcode = in.readInt();
+            read.readOneBarcode = in.readInt();
+            read.readTwoBarcode = in.readInt();
             return read;
         } catch (final IOException ioe) {
             throw new PicardException("Exception writing ReadEnds to file.", ioe);
