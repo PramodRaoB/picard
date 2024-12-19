@@ -271,4 +271,12 @@ public class ReadEndsForMarkDuplicatesCodec implements SortingCollection.Codec<R
             standardInput.close();
         }
     }
+
+    public DataInputStream getInputStream() {
+        return standardInput;
+    }
+
+    public DataOutputStream getOutputStream() {
+        return standardOutput;
+    }
 }
