@@ -438,11 +438,10 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
                 idx++;
             }
 
-            OperationTimer.stop("Main reader/writer loop");
             log.info("Concatenating " + tempFiles.size() + " temp files...");
-            OperationTimer.start("File concatenation");
+            OperationTimer.start("File concatenation (inside Main read/write)");
             concatenateFiles(tempFiles);
-            OperationTimer.stop("File concatenation");
+            OperationTimer.stop("File concatenation (inside Main read/write)");
         } catch (Exception e) {
             StringWriter sw = new StringWriter();
             e.printStackTrace(new PrintWriter(sw));
@@ -451,6 +450,7 @@ public class MarkDuplicates extends AbstractMarkDuplicatesCommandLineProgram imp
 
         executor.shutdown();
         headerAndIterator.iterator.close();
+        OperationTimer.stop("Main reader/writer loop");
 
         log.info("Closed outputs. Getting more Memory Stats.");
         reportMemoryStats("After output close");
